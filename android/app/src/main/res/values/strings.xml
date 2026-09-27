@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">UNIVERSE</string>
+    <string name="title_activity_main">UNIVERSE</string>
+    <string name="package_name">com.digitalminds.universe</string>
+    <string name="custom_url_scheme">com.digitalminds.universe</string>
+</resources>

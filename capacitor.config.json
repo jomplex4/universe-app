@@ -1,0 +1,6 @@
+{
+  "appId": "com.digitalminds.universe",
+  "appName": "UNIVERSE",
+  "webDir": "www",
+  "android": { "backgroundColor": "#000000" }
+}

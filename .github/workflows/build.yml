@@ -1,0 +1,75 @@
+name: Build UNIVERSE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: universe-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install
+        run: npm ci
+
+      - name: Build web
+        run: npm run build
+
+      - name: Sync Android
+        run: npx cap sync android
+
+      - name: Build APK
+        run: |
+          chmod +x android/gradlew
+          cd android && ./gradlew assembleRelease assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APKs
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk out/UNIVERSE.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk out/UNIVERSE-backup.apk
+          ls -lh out
+
+      - name: Publish release (download from your phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: UNIVERSE build ${{ github.run_number }}
+          make_latest: true
+          files: |
+            out/UNIVERSE.apk
+            out/UNIVERSE-backup.apk
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: www
+
+  web:
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/deploy-pages@v4
