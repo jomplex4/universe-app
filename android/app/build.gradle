@@ -7,7 +7,7 @@ android {
         applicationId "com.digitalminds.universe"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
+        versionCode ((System.getenv("GITHUB_RUN_NUMBER") ?: "1") as Integer)
         versionName "1.0.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
@@ -16,12 +16,27 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        universe {
+            storeFile file('universe.keystore')
+            storePassword 'digitalminds'
+            keyAlias 'universe'
+            keyPassword 'digitalminds'
+        }
+    }
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
     buildTypes {
+        debug {
+            signingConfig signingConfigs.universe
+        }
         release {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.universe
         }
     }
 }

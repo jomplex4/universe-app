@@ -8,11 +8,11 @@
      color, so every transition is gradual unless a scene is
      meant to be a hard cut (Jump, Blink, Strobe).
 ============================================================= */
-import { BleClient } from '@capacitor-community/bluetooth-le';
 import { Capacitor, registerPlugin } from '@capacitor/core';
 
 const NATIVE = Capacitor.isNativePlatform();
 const MusicLibrary = registerPlugin('MusicLibrary');
+const Strip = registerPlugin('Strip');   // our own native Bluetooth (APK)
 const $ = (id) => document.getElementById(id);
 
 /* ---------------- state ---------------- */
@@ -23,50 +23,51 @@ const S = Object.assign(
 function save() { localStorage.setItem('u_state', JSON.stringify(S)); }
 function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
 
-/* ---------------- BLE (web + native via one API) ---------------- */
+/* ---------------- BLE: native (APK) and Web Bluetooth (Chrome) ---------------- */
 const SERVICE = '0000fff0-0000-1000-8000-00805f9b34fb';
-const BLE = {
-  id: null, svc: null, ch: null, noResp: true, connected: false, ready: false,
-  async init() {
-    if (this.ready) return;
-    await BleClient.initialize({ androidNeverForLocation: true });
-    this.ready = true;
-  },
-  async open(deviceId) {
-    await BleClient.connect(deviceId, () => onLost(), { timeout: 8000 });
-    const services = await BleClient.getServices(deviceId);
-    const svc = services.find((s) => s.uuid.toLowerCase().startsWith('0000fff0')) || services[0];
-    const chars = svc ? svc.characteristics : [];
-    const c = chars.find((x) => x.properties.writeWithoutResponse) || chars.find((x) => x.properties.write);
-    if (!c) throw new Error('This strip did not expose a writable channel');
-    this.id = deviceId; this.svc = svc.uuid; this.ch = c.uuid;
-    this.noResp = !!c.properties.writeWithoutResponse;
-    this.connected = true;
-    S.lastId = deviceId; save();
-  },
+const IS_STRIP = (n) => /^(ELK|MELK|LEDBLE|BLEDOM)/i.test(n || '');
+const err = (code) => Object.assign(new Error(code), { code });
+
+const NativeBLE = {
+  connected: false,
+  async open(id) { await Strip.connect({ id }); this.connected = true; S.lastId = id; save(); },
   async connect() {
-    await this.init();
-    if (NATIVE && S.lastId) {
-      try { await this.open(S.lastId); return; } catch (e) { /* fall back to picker */ }
-    }
-    const dev = await BleClient.requestDevice({ namePrefix: 'ELK', optionalServices: [SERVICE] });
-    await this.open(dev.deviceId);
+    const st = await Strip.status();
+    if (!st.supported) throw err('NO_BLUETOOTH');
+    if (!st.enabled) await Strip.enable();                       // one tap system dialog
+    if (S.lastId) { try { await this.open(S.lastId); return; } catch (e) { /* try the paired list */ } }
+    const { devices } = await Strip.bonded();                      // paired strip: no scan, no Location
+    for (const d of devices.filter((x) => IS_STRIP(x.name))) { try { await this.open(d.id); return; } catch (e) { /* next */ } }
+    const found = ((await Strip.scan({ ms: 4000 })).devices || []).filter((x) => IS_STRIP(x.name)).sort((a, b) => b.rssi - a.rssi);
+    if (!found.length) throw err('NO_STRIP');
+    const pick = found.length === 1 ? found[0] : await chooseStrip(found);
+    await this.open(pick.id);
+  },
+  write(bytes) { return Strip.write({ bytes }).catch(() => {}); },
+  async disconnect() { this.connected = false; try { await Strip.disconnect(); } catch (e) { /* ignore */ } }
+};
+if (NATIVE) Strip.addListener('disconnected', () => onLost());
+
+const WebBLE = {
+  connected: false, ch: null, dev: null,
+  async connect() {
+    if (!navigator.bluetooth) throw err('NO_WEB_BT');
+    this.dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'ELK' }], optionalServices: [SERVICE] });
+    this.dev.addEventListener('gattserverdisconnected', () => { if (this.connected) onLost(); });
+    const server = await this.dev.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    const chars = await svc.getCharacteristics();
+    this.ch = chars.find((c) => c.properties.writeWithoutResponse) || chars.find((c) => c.properties.write);
+    if (!this.ch) throw err('NOT_A_STRIP');
+    this.connected = true;
   },
   async write(bytes) {
-    if (!this.connected) return;
-    const dv = new DataView(new Uint8Array(bytes).buffer);
-    try {
-      if (this.noResp) await BleClient.writeWithoutResponse(this.id, this.svc, this.ch, dv);
-      else await BleClient.write(this.id, this.svc, this.ch, dv);
-    } catch (e) {
-      try { await BleClient.write(this.id, this.svc, this.ch, dv); } catch (e2) { /* ignore */ }
-    }
+    if (!this.ch) return; const d = new Uint8Array(bytes);
+    try { if (this.ch.properties.writeWithoutResponse) await this.ch.writeValueWithoutResponse(d); else await this.ch.writeValue(d); } catch (e) { /* ignore */ }
   },
-  async disconnect() {
-    const id = this.id; this.connected = false;
-    try { if (id) await BleClient.disconnect(id); } catch (e) { /* ignore */ }
-  }
+  async disconnect() { this.connected = false; try { this.dev && this.dev.gatt.disconnect(); } catch (e) { /* ignore */ } }
 };
+const BLE = NATIVE ? NativeBLE : WebBLE;
 
 /* ---------------- delivery lane: power is queued, color keeps only the latest ---------------- */
 const CMD = {
@@ -122,8 +123,14 @@ let pulseK = 1;               // only the optional Pulse switch may move intensi
 let stripOn = null;          // what the strip currently is (power)
 const rate = () => 0.15 + (S.speed / 100) * 1.85;
 
+let lastTickAt = 0;
+let rtReady = false;
 function tick() {
-  const t = (performance.now() - t0) / 1000;
+  const now = performance.now();
+  if (now - lastTickAt < 40) return;          // native ticker + JS timer never double up
+  lastTickAt = now;
+  routineCheck();
+  const t = (now - t0) / 1000;
   const target = gen(t);
   for (let i = 0; i < 3; i++) out[i] += (target[i] - out[i]) * ease;
   const wantOn = S.power && S.bright > 0;
@@ -137,6 +144,7 @@ function tick() {
   if (key !== lastSent) { lastSent = key; sendColor(c); }
 }
 setInterval(tick, 50);
+window.__ut = tick;               // the APK calls this while in the background
 
 function setMode(m, g, e) { mode = m; gen = g; ease = e; pulseK = 1; t0 = performance.now(); if (m !== 'voice') stopMic(); }
 function solid(fromUser) {
@@ -248,6 +256,8 @@ function wireMedia() {
   audioCtx();
   if (!mediaSrc) { mediaSrc = actx.createMediaElementSource(au); mediaSrc.connect(actx.destination); mediaSrc.connect(analyser); }
 }
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(err('TIMEOUT')), ms))]);
+let libLoading = false;
 async function loadLibrary() {
   if (!NATIVE) {
     $('musicSub').textContent = 'Folder playback works in the Android app. Here, the strip follows the sound around you.';
@@ -255,10 +265,22 @@ async function loadLibrary() {
     startMicMusic(); return;
   }
   if (LIB) { renderList(); return; }
+  if (libLoading) return;
+  libLoading = true;
   $('mlist').innerHTML = '<div class="empty">Reading your music...</div>';
-  try { LIB = (await MusicLibrary.getLibrary()).folders || []; renderList(); }
-  catch (e) { $('mlist').innerHTML = '<div class="empty">Allow access to your music to see your folders.<br><br><button class="wskip" id="retryLib">Try again</button></div>';
-    const r = $('retryLib'); if (r) r.onclick = () => { LIB = null; loadLibrary(); }; }
+  const p = MusicLibrary.getLibrary();
+  p.then((r) => { LIB = r.folders || []; if (sub === 'music') renderList(); }).catch(() => {}); // late answers still show up
+  try { await withTimeout(p, 30000); }
+  catch (e) {
+    const denied = /PERMISSION/.test((e && (e.code || e.message)) || '');
+    $('mlist').innerHTML = '<div class="empty">' + (denied
+      ? 'UNIVERSE needs access to your music to show your folders.'
+      : 'Your music is taking too long to load.') +
+      '<br><br><button class="wskip" id="retryLib">Try again</button>' + (denied ? '&nbsp;&nbsp;<button class="wskip" id="setLib">Open settings</button>' : '') + '</div>';
+    $('retryLib').onclick = () => loadLibrary();
+    if (denied) $('setLib').onclick = () => MusicLibrary.openAppSettings();
+  }
+  libLoading = false;
 }
 async function startMicMusic() {
   try { audioCtx(); micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -307,7 +329,9 @@ au.addEventListener('ended', () => playAt(qi + 1));
 $('ppB').onclick = () => { if (au.paused) { audioCtx(); au.play(); } else au.pause(); };
 $('nextB').onclick = () => playAt(qi + 1);
 $('prevB').onclick = () => (au.currentTime > 3 ? (au.currentTime = 0) : playAt(qi - 1));
-document.querySelectorAll('#musicSeg button').forEach((b) => (b.onclick = () => { view = b.dataset.m; openFolder = null; if (LIB) renderList(); }));
+document.querySelectorAll('#musicSeg button').forEach((b) => (b.onclick = () => { view = b.dataset.m; openFolder = null;
+  document.querySelectorAll('#musicSeg button').forEach((x) => x.classList.toggle('sel', x === b));
+  if (LIB) renderList(); else loadLibrary(); }));
 
 /* ---------------- music style + pulse ---------------- */
 const HINT = { disco: 'Disco: kick drums go red, vocals green, cymbals blue.', flow: 'Flow: colors glide around the wheel and jump on every beat.' };
@@ -392,37 +416,74 @@ $('pwr').onclick = () => {
   toast(S.power ? 'Strip on' : 'Strip off');
 };
 function setStatus(on) { $('status').classList.toggle('on', on); $('statusTxt').textContent = on ? 'Connected' : 'Tap to connect'; }
-function onLost() { BLE.connected = false; stripOn = null; setStatus(false); toast('Strip disconnected'); }
+function onLost() { BLE.connected = false; stripOn = null; setStatus(false); if (NATIVE) Strip.keepAlive({ on: false }).catch(() => {}); toast('Strip disconnected'); }
 
+const MSG = {
+  BT_OFF: 'Bluetooth is off. Turn it on to connect.',
+  PERMISSION_DENIED: 'Allow "Nearby devices" so UNIVERSE can reach your strip.',
+  NO_STRIP: 'No strip found. Check it is plugged in and close the other LED app.',
+  CONNECT_FAILED: 'Could not connect. Close the other LED app and try again.',
+  TIMEOUT: 'The strip did not answer. Close the other LED app and try again.',
+  NOT_A_STRIP: 'That device is not a compatible LED strip.',
+  NO_BLUETOOTH: 'This phone has no Bluetooth.',
+  NO_WEB_BT: 'Open this page in Chrome to use Bluetooth.'
+};
+function explain(e) {
+  const c = (e && (e.code || e.message)) || '';
+  if (/cancel/i.test(c)) return 'No strip selected';
+  return MSG[c] || 'Could not connect. Try again.';
+}
 async function doConnect(fromWelcome) {
-  const btn = $('connectBtn'); btn.disabled = true; $('wmsg').textContent = 'Searching...';
+  const btn = $('connectBtn'); btn.disabled = true; $('wmsg').textContent = 'Connecting...';
   try {
-    if (NATIVE && !(await BleClient.isEnabled())) { await BleClient.requestEnable(); }
     await BLE.connect();
     stripOn = null; lastSent = ''; setStatus(true); $('welcome').classList.add('hide'); $('wmsg').textContent = '';
+    if (NATIVE) { Strip.keepAlive({ on: true }).catch(() => {}); syncRoutines(); }
     if (!fromWelcome) toast('Connected');
   } catch (e) {
-    let m = (e && e.message) || 'Could not connect';
-    if (/cancel/i.test(m)) m = 'No strip selected';
-    if (NATIVE) { try { if (!(await BleClient.isLocationEnabled())) m = 'Turn on Location so the phone can find the strip'; } catch (x) {} }
-    $('wmsg').textContent = m; if (!fromWelcome) toast(m);
+    const code = (e && (e.code || e.message)) || '';
+    if (code === 'LOCATION_OFF') { $('wmsg').textContent = ''; showLocationHelp(); }
+    else if (code === 'PERMISSION_DENIED' && NATIVE) {
+      $('wmsg').textContent = '';
+      openSheet('Permission needed', 'UNIVERSE needs the "Nearby devices" permission to talk to your strip. Open settings, tap Permissions and allow it.',
+        [['Open settings', 'dang', () => Strip.openAppSettings()], ['Cancel', '', null]]);
+    }
+    else { const m = explain(e); $('wmsg').textContent = m; if (!fromWelcome) toast(m); }
   }
   btn.disabled = false;
 }
+/* Only reached if the strip was never connected AND is not paired, on Android 11 or older. */
+function showLocationHelp() {
+  openSheet('Find your strip', 'This is only needed once. To search for a new strip, Android 11 requires Location to be on. After the first connection UNIVERSE connects directly and never asks again. Tip: pairing the strip in Bluetooth settings skips this step entirely.',
+    [['Open Location settings', 'dang', () => Strip.openLocationSettings()], ['Cancel', '', null]]);
+}
+function chooseStrip(list) {
+  return new Promise((res, rej) => openSheet('Choose your strip', 'Several strips are nearby. Pick yours.',
+    list.map((d) => [d.name + '  ·  ' + d.id.slice(-5), '', () => res(d)]).concat([['Cancel', '', () => rej(err('cancel'))]])));
+}
+function openSheet(title, desc, buttons) {
+  $('shT').textContent = title; $('shD').textContent = desc;
+  const box = $('shBtns'); box.innerHTML = '';
+  buttons.forEach(([label, cls, fn]) => { const b = document.createElement('button'); b.textContent = label; if (cls) b.className = cls;
+    b.onclick = () => { closeSheet(); fn && fn(); }; box.appendChild(b); });
+  $('sheet').classList.remove('hide');
+}
 $('connectBtn').onclick = () => doConnect(true);
 $('skipBtn').onclick = () => $('welcome').classList.add('hide');
+function closeSheet() { $('sheet').classList.add('hide'); }
+$('sheet').onclick = (e) => { if (e.target.id === 'sheet') closeSheet(); };
+async function endSession(msg) {
+  await BLE.disconnect(); stripOn = null; setStatus(false);
+  if (NATIVE) Strip.keepAlive({ on: false }).catch(() => {});
+  toast(msg);
+}
 $('status').onclick = () => {
   if (!BLE.connected) return doConnect(false);
-  $('shD').textContent = 'Connected to your strip.'; $('sheet').classList.remove('hide');
-};
-const closeSheet = () => $('sheet').classList.add('hide');
-$('shCancel').onclick = closeSheet;
-$('sheet').onclick = (e) => { if (e.target.id === 'sheet') closeSheet(); };
-$('shDisc').onclick = async () => { closeSheet(); await BLE.disconnect(); stripOn = null; setStatus(false); toast('Disconnected'); };
-$('shOffDisc').onclick = async () => {
-  closeSheet(); S.power = false; save(); paintPower();
-  await BLE.write(CMD.power(false));
-  setTimeout(async () => { await BLE.disconnect(); stripOn = null; setStatus(false); toast('Strip off and disconnected'); }, 150);
+  openSheet('Connection', 'Connected to your strip.' + (NATIVE ? ' Lights keep running when you leave the app.' : ''), [
+    ['Turn off and disconnect', 'dang', async () => { S.power = false; save(); paintPower(); await BLE.write(CMD.power(false)); setTimeout(() => endSession('Strip off and disconnected'), 150); }],
+    ['Disconnect', '', () => endSession('Disconnected')],
+    ['Cancel', '', null]
+  ]);
 };
 
 /* ---------------- navigation (Android back button uses history) ---------------- */
@@ -473,6 +534,7 @@ function paintTicks(l) {
 
 /* ---------------- routines ---------------- */
 const RT = load('u_rt') || { on: { time: '19:00', days: [1,1,1,1,1,0,0], active: true }, off: { time: '23:00', days: [1,1,1,1,1,0,0], active: true } };
+rtReady = true;
 const DAYS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 const ampm = (t) => { let [h, m] = t.split(':').map(Number); return [(h % 12) || 12, String(m).padStart(2, '0'), h >= 12 ? 'PM' : 'AM']; };
 function renderRT() {
@@ -488,23 +550,29 @@ function renderRT() {
   document.querySelectorAll('[data-sw]').forEach((b) => (b.onclick = () => { RT[b.dataset.sw].active = !RT[b.dataset.sw].active; saveRT(); }));
   document.querySelectorAll('[data-dk]').forEach((b) => (b.onclick = () => { const d = RT[b.dataset.dk].days; d[+b.dataset.d] = d[+b.dataset.d] ? 0 : 1; saveRT(); }));
 }
-function saveRT() { localStorage.setItem('u_rt', JSON.stringify(RT)); renderRT(); }
+function saveRT() { localStorage.setItem('u_rt', JSON.stringify(RT)); renderRT(); syncRoutines(); }
 document.querySelectorAll('[data-pre]').forEach((b) => (b.onclick = () => {
   const m = { all: [1,1,1,1,1,1,1], wkdy: [1,1,1,1,1,0,0], wknd: [0,0,0,0,0,1,1] }[b.dataset.pre];
   RT.on.days = m.slice(); RT.off.days = m.slice(); saveRT(); toast('Days updated');
 }));
-let fired = '';
-setInterval(() => {
+function syncRoutines() {
+  if (NATIVE && S.lastId) Strip.setRoutines({ mac: S.lastId, on: RT.on, off: RT.off }).catch(() => {});
+}
+let fired = '', lastRoutineCheck = 0;
+function routineCheck() {
+  if (!rtReady) return;
+  const nowMs = Date.now(); if (nowMs - lastRoutineCheck < 1000) return; lastRoutineCheck = nowMs;
   const d = new Date(), day = (d.getDay() + 6) % 7;
   const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   ['on', 'off'].forEach((k) => {
     const r = RT[k], key = k + hm + day;
     if (r.active && r.days[day] && r.time === hm && fired !== key) { fired = key; S.power = k === 'on'; if (S.power && !S.bright) setNum('bright', 60); save(); paintPower(); toast('Routine: strip ' + k); }
   });
-}, 15000);
+}
 
 /* ---------------- toast + boot ---------------- */
 function toast(m) { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(t.h); t.h = setTimeout(() => t.classList.remove('show'), 2200); }
 Object.keys(NUM).forEach((k) => setNum(k, S[k]));
 showColor([S.r, S.g, S.b]); paintPower(); renderRT(); setStatus(false); solid(false);
+if (NATIVE) $('rtHint').textContent = 'Routines also run when the app is closed, as long as Bluetooth is on.';
 requestAnimationFrame(placeHandle);

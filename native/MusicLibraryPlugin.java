@@ -8,13 +8,10 @@ import android.provider.MediaStore;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
-import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
-import com.getcapacitor.annotation.Permission;
-import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -30,35 +27,31 @@ import java.util.TreeMap;
  * agrupa por la carpeta real donde estan guardadas (ej. "Old School").
  * Sin dependencias extra: usa solo MediaStore de Android.
  */
-@CapacitorPlugin(
-    name = "MusicLibrary",
-    permissions = {
-        @Permission(alias = "audioModern", strings = { "android.permission.READ_MEDIA_AUDIO" }),
-        @Permission(alias = "audioLegacy", strings = { Manifest.permission.READ_EXTERNAL_STORAGE })
-    }
-)
+@CapacitorPlugin(name = "MusicLibrary")
 public class MusicLibraryPlugin extends Plugin {
 
-    private String alias() {
-        return Build.VERSION.SDK_INT >= 33 ? "audioModern" : "audioLegacy";
+    private final Perms perms = new Perms();
+
+    @Override
+    public void load() {
+        perms.register(getActivity());
+    }
+
+    private String[] needed() {
+        return new String[] { Build.VERSION.SDK_INT >= 33 ? "android.permission.READ_MEDIA_AUDIO" : Manifest.permission.READ_EXTERNAL_STORAGE };
     }
 
     @PluginMethod
     public void getLibrary(PluginCall call) {
-        if (getPermissionState(alias()) != PermissionState.GRANTED) {
-            requestPermissionForAlias(alias(), call, "permCallback");
-            return;
-        }
-        load(call);
+        perms.ensure(getContext(), needed(),
+            () -> new Thread(() -> load(call)).start(),
+            () -> call.reject("PERMISSION_DENIED"));
     }
 
-    @PermissionCallback
-    private void permCallback(PluginCall call) {
-        if (getPermissionState(alias()) == PermissionState.GRANTED) {
-            load(call);
-        } else {
-            call.reject("PERMISSION_DENIED");
-        }
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        Perms.openAppSettings(getContext());
+        call.resolve();
     }
 
     private void load(PluginCall call) {
