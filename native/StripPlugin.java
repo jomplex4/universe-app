@@ -16,11 +16,14 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.view.View;
+import android.view.WindowManager;
 
 import androidx.activity.result.ActivityResult;
 import androidx.core.content.ContextCompat;
@@ -69,6 +72,11 @@ public class StripPlugin extends Plugin {
     @Override
     public void load() {
         perms.register(getActivity());
+        LightService.listener = (action) -> {
+            JSObject o = new JSObject();
+            o.put("action", action);
+            notifyListeners("media", o);
+        };
     }
 
     private static String[] connectPerms() {
@@ -283,7 +291,13 @@ public class StripPlugin extends Plugin {
         byte[] b = new byte[arr.length()];
         try { for (int i = 0; i < b.length; i++) b[i] = (byte) arr.getInt(i); }
         catch (Exception e) { call.reject("BAD_DATA"); return; }
+        boolean reliable = Boolean.TRUE.equals(call.getBoolean("reliable", false));
+        attemptWrite(call, b, reliable ? 12 : 1);
+    }
 
+    /** Power commands retry until the radio accepts them; color frames are simply replaced by the next one. */
+    private void attemptWrite(PluginCall call, byte[] b, int triesLeft) {
+        if (gatt == null || ch == null) { call.resolve(); return; }
         boolean noResp = (ch.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
         int type = noResp ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
         boolean ok;
@@ -296,11 +310,14 @@ public class StripPlugin extends Plugin {
                 ok = gatt.writeCharacteristic(ch);
             }
         } catch (Exception e) { ok = false; }
-        if (!ok) { call.resolve(); return; }   // busy radio: drop this frame, the next one follows
-        if (writeCall != null) writeCall.resolve();
+        if (!ok) {
+            if (triesLeft > 1) { main.postDelayed(() -> attemptWrite(call, b, triesLeft - 1), 40); return; }
+            call.resolve();
+            return;
+        }
+        if (writeCall != null && writeCall != call) writeCall.resolve();
         writeCall = call;
-        final PluginCall mine = call;
-        main.postDelayed(() -> { if (writeCall == mine) { writeCall.resolve(); writeCall = null; } }, 300);
+        main.postDelayed(() -> { if (writeCall == call) { writeCall.resolve(); writeCall = null; } }, 300);
     }
 
     @PluginMethod
@@ -330,22 +347,37 @@ public class StripPlugin extends Plugin {
         }
     };
 
+    /**
+     * session({ on, bt, media, playing, light, title, artist })
+     * Starts, updates or stops the background notification. "on" false stops it.
+     */
     @PluginMethod
-    public void keepAlive(PluginCall call) {
+    public void session(PluginCall call) {
         boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
-        if (on && Build.VERSION.SDK_INT >= 33) {
-            // Optional: the service works even if notifications are refused.
-            Runnable go = () -> startStop(call, true);
+        if (on && Build.VERSION.SDK_INT >= 33 && !Perms.has(getContext(), "android.permission.POST_NOTIFICATIONS") && !askedNotify) {
+            askedNotify = true;   // optional: everything works even if refused
+            Runnable go = () -> applySession(call, true);
             perms.ensure(getContext(), new String[] { "android.permission.POST_NOTIFICATIONS" }, go, go);
             return;
         }
-        startStop(call, on);
+        applySession(call, on);
     }
 
-    private void startStop(PluginCall call, boolean on) {
+    private boolean askedNotify = false;
+
+    private void applySession(PluginCall call, boolean on) {
         Context ctx = getContext();
         Intent svc = new Intent(ctx, LightService.class);
         if (on) {
+            svc.setAction(LightService.ACT_UPDATE)
+                .putExtra("bt", Boolean.TRUE.equals(call.getBoolean("bt", false)))
+                .putExtra("media", Boolean.TRUE.equals(call.getBoolean("media", false)))
+                .putExtra("playing", Boolean.TRUE.equals(call.getBoolean("playing", false)))
+                .putExtra("light", Boolean.TRUE.equals(call.getBoolean("light", true)))
+                .putExtra("title", call.getString("title", ""))
+                .putExtra("artist", call.getString("artist", ""))
+                .putExtra("position", (long) call.getInt("position", 0))
+                .putExtra("duration", (long) call.getInt("duration", 0));
             try { ContextCompat.startForegroundService(ctx, svc); } catch (Exception ignored) { }
             if (!ticking) { ticking = true; main.post(ticker); }
         } else {
@@ -353,6 +385,28 @@ public class StripPlugin extends Plugin {
             ctx.stopService(svc);
         }
         call.resolve();
+    }
+
+    /** Full-screen player: hides Android bars and optionally turns the screen sideways. */
+    @PluginMethod
+    public void immersive(PluginCall call) {
+        boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
+        boolean land = Boolean.TRUE.equals(call.getBoolean("landscape", false));
+        getActivity().runOnUiThread(() -> {
+            android.app.Activity a = getActivity();
+            a.setRequestedOrientation(on && land ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+            View decor = a.getWindow().getDecorView();
+            if (on) {
+                a.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+            } else {
+                a.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+            }
+            call.resolve();
+        });
     }
 
     @PluginMethod
@@ -365,6 +419,7 @@ public class StripPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         ticking = false;
+        LightService.listener = null;
         closeGatt();
         try { getContext().stopService(new Intent(getContext(), LightService.class)); } catch (Exception ignored) { }
     }

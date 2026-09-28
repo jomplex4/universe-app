@@ -11,10 +11,16 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(StripPlugin.class);
         registerPlugin(MusicLibraryPlugin.class);
         super.onCreate(savedInstanceState);
-        // Keep the web engine at full priority while the app is in the background.
         try {
-            if (Build.VERSION.SDK_INT >= 26 && getBridge() != null && getBridge().getWebView() != null) {
-                getBridge().getWebView().setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+            if (getBridge() != null) {
+                // Songs and videos with correct byte ranges (seeking, every MP4 loads).
+                getBridge().setWebViewClient(new MediaWebViewClient(getBridge()));
+                WebView wv = getBridge().getWebView();
+                if (wv != null) {
+                    wv.getSettings().setMediaPlaybackRequiresUserGesture(false);
+                    // Keep the web engine at full priority while the app is in the background.
+                    if (Build.VERSION.SDK_INT >= 26) wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+                }
             }
         } catch (Exception ignored) { }
     }

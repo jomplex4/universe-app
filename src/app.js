@@ -43,7 +43,7 @@ const NativeBLE = {
     const pick = found.length === 1 ? found[0] : await chooseStrip(found);
     await this.open(pick.id);
   },
-  write(bytes) { return Strip.write({ bytes }).catch(() => {}); },
+  write(bytes, reliable) { return Strip.write({ bytes, reliable: !!reliable }).catch(() => {}); },
   async disconnect() { this.connected = false; try { await Strip.disconnect(); } catch (e) { /* ignore */ } }
 };
 if (NATIVE) Strip.addListener('disconnected', () => onLost());
@@ -61,9 +61,13 @@ const WebBLE = {
     if (!this.ch) throw err('NOT_A_STRIP');
     this.connected = true;
   },
-  async write(bytes) {
+  async write(bytes, reliable) {
     if (!this.ch) return; const d = new Uint8Array(bytes);
-    try { if (this.ch.properties.writeWithoutResponse) await this.ch.writeValueWithoutResponse(d); else await this.ch.writeValue(d); } catch (e) { /* ignore */ }
+    const safe = reliable && this.ch.properties.write;   // power: wait for the strip to confirm
+    for (let i = 0; i < (reliable ? 6 : 1); i++) {
+      try { if (!safe && this.ch.properties.writeWithoutResponse) await this.ch.writeValueWithoutResponse(d); else await this.ch.writeValue(d); return; }
+      catch (e) { await new Promise((r) => setTimeout(r, 35)); }
+    }
   },
   async disconnect() { this.connected = false; try { this.dev && this.dev.gatt.disconnect(); } catch (e) { /* ignore */ } }
 };
@@ -74,17 +78,20 @@ const CMD = {
   power: (on) => [0x7e, 0, 4, on ? 1 : 0, 0, 0, 0, 0, 0xef],
   color: (r, g, b) => [0x7e, 0, 5, 3, r & 255, g & 255, b & 255, 0, 0xef]
 };
-const queue = []; let busy = false; let latestColor = null;
+const queue = []; let busy = false; let latestColor = null; let lastSendAt = 0;
 function pump() {
   if (busy || !BLE.connected) return;
-  let bytes;
-  if (queue.length) bytes = queue.shift();
-  else if (latestColor) { bytes = latestColor; latestColor = null; }
+  let job;
+  if (queue.length) job = queue.shift();
+  else if (latestColor) { job = { bytes: latestColor, reliable: performance.now() < burstUntil }; latestColor = null; }   // confirmed right after power on
   else return;
-  busy = true;
-  BLE.write(bytes).finally(() => setTimeout(() => { busy = false; pump(); }, 45));
+  busy = true; lastSendAt = performance.now();
+  BLE.write(job.bytes, job.reliable).finally(() => setTimeout(() => { busy = false; pump(); }, 45));
 }
-function sendPower(on) { queue.push(CMD.power(on)); pump(); }
+function sendPower(on) {                       // power is never dropped: queued, retried natively
+  for (let i = queue.length - 1; i >= 0; i--) if (queue[i].power) queue.splice(i, 1);   // only the latest state matters
+  queue.push({ bytes: CMD.power(on), reliable: true, power: true }); pump();
+}
 function sendColor(rgb) { latestColor = CMD.color(rgb[0], rgb[1], rgb[2]); pump(); }
 
 /* ---------------- color math ---------------- */
@@ -124,6 +131,7 @@ let stripOn = null;          // what the strip currently is (power)
 const rate = () => 0.15 + (S.speed / 100) * 1.85;
 
 let lastTickAt = 0;
+let lastPowerAt = 0, burstUntil = 0, lastReassert = 0, powerRepeats = 0, snapNow = false;
 let rtReady = false;
 function tick() {
   const now = performance.now();
@@ -132,10 +140,20 @@ function tick() {
   routineCheck();
   const t = (now - t0) / 1000;
   const target = gen(t);
-  for (let i = 0; i < 3; i++) out[i] += (target[i] - out[i]) * ease;
+  const e = snapNow ? 1 : ease; snapNow = false;
+  for (let i = 0; i < 3; i++) out[i] += (target[i] - out[i]) * e;
+  if (!BLE.connected) return;
   const wantOn = S.power && S.bright > 0;
-  if (BLE.connected && stripOn !== wantOn) { sendPower(wantOn); stripOn = wantOn; lastSent = ''; }
-  if (!wantOn || !BLE.connected) return;
+  // Power changes are sent at once; the state is re-affirmed every few seconds so a lost packet heals itself.
+  if (stripOn !== wantOn) { burstUntil = now + 1500; powerRepeats = 2; }   // after a change: repeat it twice more
+  const repeatDue = powerRepeats > 0 && now - lastPowerAt > 450;
+  if (stripOn !== wantOn || repeatDue || now - lastPowerAt > 3000) {
+    if (repeatDue && stripOn === wantOn) powerRepeats--;
+    sendPower(wantOn); stripOn = wantOn; lastPowerAt = now; lastSent = '';
+  }
+  if (now < burstUntil && now - lastReassert > 150) { lastReassert = now; lastSent = ''; }
+  if (!wantOn) { if (lastSent !== 'off') { lastSent = 'off'; sendColor([0, 0, 0]); } return; }   // black as backup
+  if (now - lastSendAt > 2500) lastSent = '';                                                       // idle heartbeat
   // Keep intensity locked to the target: blending two hues must never dim the strip.
   const tm = mode === 'solid' ? Math.max(target[0], target[1], target[2]) : 255, om = Math.max(out[0], out[1], out[2]);
   const k = (S.bright / 100) * (om > 1 && tm > 0 ? tm / om : 1) * (mode === 'music' ? pulseK : 1);
@@ -185,7 +203,8 @@ let actx = null, analyser = null, buf = null, mediaSrc = null, micStream = null,
 function audioCtx() {
   if (!actx) {
     actx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = actx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.6;
+    analyser = actx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.35;
+    analyser.minDecibels = -90; analyser.maxDecibels = -10;   // wide range: loud music never saturates
     buf = new Uint8Array(analyser.frequencyBinCount);
   }
   if (actx.state === 'suspended') actx.resume();
@@ -193,8 +212,10 @@ function audioCtx() {
 }
 const band = (a, b) => { let s = 0; for (let i = a; i < b; i++) s += buf[i]; return s / (b - a) / 255; };
 
+const CLUB = [[255,0,0],[0,70,255],[255,0,200],[0,255,200],[255,140,0],[140,0,255],[0,255,40],[255,0,70]];
 function reactiveGen(kind) {
   let hue = rgbHsv(S.r, S.g, S.b)[0], avgBass = 0.1, avgMid = 0.1, avgHigh = 0.1, lastBeat = 0, lvl = 0, kick = 0;
+  let hard = 0, punch = 1, ci = 0, avgFlux = 0.01; const beats = []; const prev = new Uint8Array(buf ? buf.length : 256);
   let last = [255, 0, 0];
   return (t) => {
     if (!analyser) return hsvRgb(hue, 1, 1);
@@ -213,7 +234,13 @@ function reactiveGen(kind) {
     avgBass += (bass - avgBass) * 0.03; avgMid += (mid - avgMid) * 0.03; avgHigh += (high - avgHigh) * 0.03;
     const loud = clamp(energy * s * 2.4, 0, 1);
     pulseK = S.pulse ? (pulseK += ((0.22 + 0.78 * loud) - pulseK) * 0.5) : 1;
-    const beat = bass > avgBass * 1.3 + 0.04 && t - lastBeat > 0.18;
+    // Beat = sudden NEW energy in the low end (spectral flux), robust with any mix or volume.
+    let flux = 0; const b0 = hz(40), b1 = hz(160) + 1;
+    for (let i = b0; i < b1; i++) { const d = buf[i] - prev[i]; if (d > 0) flux += d; }
+    flux /= (b1 - b0) * 255;
+    prev.set(buf);
+    avgFlux += (flux - avgFlux) * 0.05;
+    const beat = flux > avgFlux * 2 + 0.02 && t - lastBeat > 0.2;
     if (beat) lastBeat = t;
 
     if (S.mstyle === 'flow') {
@@ -221,24 +248,45 @@ function reactiveGen(kind) {
       hue += energy * s * 1.2;
       last = hsvRgb(hue, 1, 1); return last;
     }
-    // DISCO: each band is compared with its own recent average, so the
-    // instrument that is standing out right now decides the color family.
+    // DISCO reads the song. "hard" (0..1) rises with strong, frequent kicks (phonk, drops)
+    // and falls on calm passages, so one song can go from smooth fades to hard club cuts.
+    if (beat) {
+      const strength = flux / (avgFlux + 0.005);
+      punch += (strength - punch) * 0.3;
+      beats.push(t);
+    }
+    while (beats.length && t - beats[0] > 4) beats.shift();
+    punch += (1 - punch) * 0.008;
+    const rate = beats.length / 4;
+    const raw = Math.sqrt(clamp((rate - 0.6) / 1.4, 0, 1) * clamp((punch - 2) / 3, 0, 1)) * clamp(loud * 2.5, 0, 1);   // strong AND frequent
+    hard += (raw - hard) * 0.04;
+    window.__hard = hard;
+
     if (energy < 0.015) return last;                 // silence: hold the color, never black
+    // Instrument color: the band standing out right now (kick red, vocals green, cymbals blue).
     const eb = Math.pow(bass / (avgBass + 0.03), 3);
     const em = Math.pow(mid / (avgMid + 0.03), 3);
     const eh = Math.pow(high / (avgHigh + 0.03), 3);
     let c = [eb, em, eh];
-    const mn = Math.min(eb, em, eh); c = c.map((v) => v - mn * 0.85); // keep it saturated, not white
+    const mn = Math.min(eb, em, eh); c = c.map((v) => v - mn * 0.85);
     const mx = Math.max(c[0], c[1], c[2]) || 1; c = c.map((v) => (v / mx) * 255);
-    kick = beat ? 1 : kick * 0.68;
-    last = mix(c, [255, 0, 0], kick * 0.75);         // every kick punches toward red
+
+    // Club color: on each beat jump to a clearly different color and hold it.
+    if (beat) {
+      ci = (ci + 2 + (Math.random() < 0.5 ? 0 : 1)) % CLUB.length;
+      if (hard > 0.55) snapNow = true;               // hard cut, no fade
+    }
+    kick = beat ? 1 : kick * 0.7;
+    const soft = mix(c, [255, 0, 0], kick * 0.35);
+    last = mix(soft, CLUB[ci], clamp((hard - 0.35) / 0.4, 0, 1));
+    ease = 0.12 + hard * 0.78;                       // calm: slow fades, hard: instant
     return last;
   };
 }
 
 async function startVoice() {
   try {
-    audioCtx(); if (!au.paused) au.pause();
+    audioCtx(); [au, vid].forEach((m) => { if (!m.paused) m.pause(); });
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
     micSrc = actx.createMediaStreamSource(micStream); micSrc.connect(analyser);
     setMode('voice', reactiveGen('voice'), 0.35); clearSel(); $('rcVoice').classList.add('sel');
@@ -249,38 +297,48 @@ function stopMic() {
   if (micStream) { micStream.getTracks().forEach((x) => x.stop()); micStream = null; }
 }
 
-/* ---------------- music library + player ---------------- */
-const au = $('au');
-let LIB = null, view = 'folders', openFolder = null, queueSongs = [], qi = -1;
-function wireMedia() {
+/* ---------------- media library + player (songs and videos) ---------------- */
+const au = $('au'), vid = $('vid');
+const LIBS = { audio: null, video: null };
+const srcNode = new Map();                  // one Web Audio source per element
+let view = 'folders', openFolder = null, queueItems = [], qi = -1, curKind = null, query = '';
+S.lib = S.lib || 'audio'; S.sort = S.sort || 'az';
+const el = () => (curKind === 'video' ? vid : au);
+const mediaUrl = (path) => (NATIVE ? '/_media/' + encodeURIComponent(path) : path);
+
+function wireMedia(m) {
   audioCtx();
-  if (!mediaSrc) { mediaSrc = actx.createMediaElementSource(au); mediaSrc.connect(actx.destination); mediaSrc.connect(analyser); }
+  if (!srcNode.has(m)) { const n = actx.createMediaElementSource(m); n.connect(actx.destination); n.connect(analyser); srcNode.set(m, n); }
 }
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(err('TIMEOUT')), ms))]);
-let libLoading = false;
+const loading = { audio: false, video: false };
 async function loadLibrary() {
+  const kind = S.lib;
   if (!NATIVE) {
-    $('musicSub').textContent = 'Folder playback works in the Android app. Here, the strip follows the sound around you.';
-    $('musicSeg').hidden = true; $('mlist').innerHTML = '';
+    $('libSeg').hidden = true; $('musicSeg').hidden = true; $('mlist').innerHTML = '';
+    document.querySelector('.tools').hidden = true;
+    $('musicSub').textContent = 'Songs and videos play in the Android app. Here, the strip follows the sound around you.';
     startMicMusic(); return;
   }
-  if (LIB) { renderList(); return; }
-  if (libLoading) return;
-  libLoading = true;
-  $('mlist').innerHTML = '<div class="empty">Reading your music...</div>';
-  const p = MusicLibrary.getLibrary();
-  p.then((r) => { LIB = r.folders || []; if (sub === 'music') renderList(); }).catch(() => {}); // late answers still show up
+  if (LIBS[kind]) { renderList(); return; }
+  if (loading[kind]) return;
+  loading[kind] = true;
+  $('mlist').innerHTML = '<div class="empty">' + (kind === 'video' ? 'Reading your videos...' : 'Reading your music...') + '</div>';
+  const p = MusicLibrary.getLibrary({ kind });
+  p.then((r) => { LIBS[kind] = r.folders || []; if (sub === 'music' && S.lib === kind) renderList(); }).catch(() => {});
   try { await withTimeout(p, 30000); }
   catch (e) {
-    const denied = /PERMISSION/.test((e && (e.code || e.message)) || '');
-    $('mlist').innerHTML = '<div class="empty">' + (denied
-      ? 'UNIVERSE needs access to your music to show your folders.'
-      : 'Your music is taking too long to load.') +
-      '<br><br><button class="wskip" id="retryLib">Try again</button>' + (denied ? '&nbsp;&nbsp;<button class="wskip" id="setLib">Open settings</button>' : '') + '</div>';
-    $('retryLib').onclick = () => loadLibrary();
-    if (denied) $('setLib').onclick = () => MusicLibrary.openAppSettings();
+    if (S.lib === kind) {
+      const denied = /PERMISSION/.test((e && (e.code || e.message)) || '');
+      $('mlist').innerHTML = '<div class="empty">' + (denied
+        ? 'UNIVERSE needs access to your ' + (kind === 'video' ? 'videos' : 'music') + ' to show your folders.'
+        : 'This is taking too long.') +
+        '<br><br><button class="wskip" id="retryLib">Try again</button>' + (denied ? '&nbsp;&nbsp;<button class="wskip" id="setLib">Open settings</button>' : '') + '</div>';
+      $('retryLib').onclick = () => loadLibrary();
+      if (denied) $('setLib').onclick = () => MusicLibrary.openAppSettings();
+    }
   }
-  libLoading = false;
+  loading[kind] = false;
 }
 async function startMicMusic() {
   try { audioCtx(); micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -288,50 +346,173 @@ async function startMicMusic() {
     mode = 'music'; gen = reactiveGen('music'); ease = 0.45; clearSel(); $('rcMusic').classList.add('sel');
   } catch (e) { toast('Allow microphone access to use Music'); }
 }
-const fmt = (ms) => { const s = Math.floor(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+const fmt = (ms) => { if (!isFinite(ms) || ms < 0) ms = 0; const s = Math.floor(ms / 1000); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s % 60).padStart(2, '0'); };
 const esc = (s) => String(s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const IC_FOLDER = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7h6l2 2h10v10H3z"/></svg>';
 const IC_NOTE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/></svg>';
+const IC_VIDEO = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+
+const byName = (a, b) => (a.title || a.name).localeCompare(b.title || b.name, undefined, { sensitivity: 'base', numeric: true });
+function sortItems(list) {
+  const k = S.sort, out = list.slice();
+  if (k === 'az') out.sort(byName); else if (k === 'za') out.sort((a, b) => byName(b, a));
+  else if (k === 'new') out.sort((a, b) => b.added - a.added); else if (k === 'old') out.sort((a, b) => a.added - b.added);
+  else if (k === 'long') out.sort((a, b) => b.duration - a.duration); else out.sort((a, b) => a.duration - b.duration);
+  return out;
+}
+function sortFolders(list) {
+  const k = S.sort, total = (f) => f.songs.reduce((t, x) => t + x.duration, 0), out = list.slice();
+  if (k === 'az' || k === 'long' || k === 'short') out.sort(byName); else if (k === 'za') out.sort((a, b) => byName(b, a));
+  else if (k === 'new') out.sort((a, b) => b.added - a.added); else out.sort((a, b) => a.added - b.added);
+  if (k === 'long') out.sort((a, b) => total(b) - total(a)); if (k === 'short') out.sort((a, b) => total(a) - total(b));
+  return out;
+}
 function renderList() {
-  const el = $('mlist');
+  const lib = LIBS[S.lib], box = $('mlist'), isV = S.lib === 'video';
+  $('allTab').textContent = isV ? 'All videos' : 'All songs';
   document.querySelectorAll('#musicSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.m === (openFolder ? 'folders' : view)));
-  if (!LIB.length) { el.innerHTML = '<div class="empty">No songs found on this phone.</div>'; return; }
-  if (view === 'folders' && !openFolder) {
-    el.innerHTML = LIB.map((f, i) => '<button class="li" data-f="' + i + '"><div class="ic">' + IC_FOLDER + '</div><div class="m"><div class="t">' + esc(f.name) + '</div><div class="d">' + f.songs.length + ' songs</div></div></button>').join('');
-    el.querySelectorAll('[data-f]').forEach((b) => (b.onclick = () => { openFolder = LIB[+b.dataset.f]; renderList(); $('view').scrollTop = 0; }));
+  if (!lib) return;
+  if (!lib.length) { box.innerHTML = '<div class="empty">' + (isV ? 'No videos found on this phone.' : 'No songs found on this phone.') + '</div>'; return; }
+  const q = query.trim().toLowerCase();
+  if (view === 'folders' && !openFolder && !q) {
+    const fs = sortFolders(lib);
+    box.innerHTML = fs.map((f, i) => '<button class="li" data-f="' + i + '"><div class="ic">' + IC_FOLDER + '</div><div class="m"><div class="t">' + esc(f.name) + '</div><div class="d">' + f.songs.length + (isV ? ' videos' : ' songs') + '</div></div></button>').join('');
+    box.querySelectorAll('[data-f]').forEach((b) => (b.onclick = () => { openFolder = fs[+b.dataset.f]; renderList(); $('view').scrollTop = 0; }));
     return;
   }
-  const songs = openFolder ? openFolder.songs : LIB.flatMap((f) => f.songs).sort((a, b) => a.title.localeCompare(b.title));
+  let items = openFolder ? openFolder.songs : lib.flatMap((f) => f.songs);
+  if (q) items = (openFolder ? openFolder.songs : lib.flatMap((f) => f.songs)).filter((x) => (x.title + ' ' + x.artist).toLowerCase().includes(q));
+  items = sortItems(items);
   const head = openFolder ? '<button class="back" id="upF"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg> ' + esc(openFolder.name) + '</button>' : '';
-  const cur = queueSongs[qi];
-  el.innerHTML = head + songs.map((s, i) => '<button class="li' + (cur && cur.path === s.path ? ' play' : '') + '" data-s="' + i + '"><div class="ic">' + IC_NOTE + '</div><div class="m"><div class="t">' + esc(s.title) + '</div><div class="d">' + esc(s.artist) + '</div></div><div class="du">' + fmt(s.duration) + '</div></button>').join('');
+  const cur = queueItems[qi];
+  box.innerHTML = head + (items.length ? items.map((x, i) => '<button class="li' + (cur && cur.path === x.path ? ' play' : '') + '" data-s="' + i + '"><div class="ic' + (isV ? ' v' : '') + '">' + (isV ? IC_VIDEO : IC_NOTE) + '</div><div class="m"><div class="t">' + esc(x.title) + '</div><div class="d">' + esc(x.artist || (isV ? 'Video' : '')) + '</div></div><div class="du">' + fmt(x.duration) + '</div></button>').join('')
+    : '<div class="empty">Nothing matches your search.</div>');
   if (openFolder) $('upF').onclick = () => { openFolder = null; renderList(); };
-  el.querySelectorAll('[data-s]').forEach((b) => (b.onclick = () => { queueSongs = songs; playAt(+b.dataset.s); }));
+  box.querySelectorAll('[data-s]').forEach((b) => (b.onclick = () => { queueItems = items; playAt(+b.dataset.s, S.lib); }));
 }
-function playAt(i) {
-  if (!queueSongs.length) return;
-  qi = (i + queueSongs.length) % queueSongs.length;
-  const s = queueSongs[qi];
-  wireMedia(); stopMic();
-  au.src = Capacitor.convertFileSrc(s.path);
-  au.play().catch(() => toast('Could not play this file'));
+
+function playAt(i, kind) {
+  if (!queueItems.length) return;
+  kind = kind || curKind || 'audio';
+  qi = (i + queueItems.length) % queueItems.length;
+  const x = queueItems[qi];
+  const other = kind === 'video' ? au : vid;
+  if (!other.paused) other.pause();
+  if (curKind && curKind !== kind) other.removeAttribute('src');
+  curKind = kind; stopMic();
+  const m = el(); wireMedia(m);
+  m.src = mediaUrl(x.path);
+  m.play().catch(() => toast('This file could not be played'));
   mode = 'music'; gen = reactiveGen('music'); ease = 0.45; clearSel(); $('rcMusic').classList.add('sel');
-  $('now').classList.remove('hide'); $('nowT').textContent = s.title; renderList();
+  $('nowT').textContent = x.title; $('vTitle').textContent = x.title;
+  $('mArt').innerHTML = kind === 'video' ? IC_VIDEO : IC_NOTE;
+  $('mini').classList.remove('hide');
+  if (kind === 'video') openPlayer();
+  if (sub === 'music') renderList();
+  syncSession();
 }
-au.addEventListener('timeupdate', () => {
-  if (!au.duration) return;
-  $('progI').style.width = (au.currentTime / au.duration) * 100 + '%';
-  $('nowD').textContent = fmt(au.currentTime * 1000) + ' / ' + fmt(au.duration * 1000);
+function togglePlay() { if (!curKind) return; const m = el(); if (m.paused) { audioCtx(); m.play(); } else m.pause(); }
+function stepTrack(d) {
+  if (!curKind) return;
+  const m = el();
+  if (d < 0 && m.currentTime > 3) { m.currentTime = 0; return; }
+  playAt(qi + d);
+}
+[au, vid].forEach((m) => {
+  m.addEventListener('timeupdate', () => { if (m !== el() || !m.duration) return;
+    const pct = (m.currentTime / m.duration) * 100;
+    $('progI').style.width = pct + '%';
+    $('nowD').textContent = fmt(m.currentTime * 1000) + ' / ' + fmt(m.duration * 1000);
+    if (m === vid && !seeking) { $('vSeek').value = Math.round(pct * 10); $('vCur').textContent = fmt(m.currentTime * 1000); $('vDur').textContent = fmt(m.duration * 1000); }
+  });
+  m.addEventListener('play', () => { if (m === el()) paintPlay(true); });
+  m.addEventListener('pause', () => { if (m === el()) paintPlay(false); });
+  m.addEventListener('ended', () => { if (m === el()) playAt(qi + 1); });
 });
-au.addEventListener('play', () => ($('ppI').innerHTML = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>'));
-au.addEventListener('pause', () => ($('ppI').innerHTML = '<path d="M7 5v14l12-7z"/>'));
-au.addEventListener('ended', () => playAt(qi + 1));
-$('ppB').onclick = () => { if (au.paused) { audioCtx(); au.play(); } else au.pause(); };
-$('nextB').onclick = () => playAt(qi + 1);
-$('prevB').onclick = () => (au.currentTime > 3 ? (au.currentTime = 0) : playAt(qi - 1));
+function paintPlay(on) {
+  const I = on ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M7 5v14l12-7z"/>';
+  $('ppI').innerHTML = I; $('vPlayI').innerHTML = on ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M8 5v14l11-7z"/>';
+  $('vp').classList.toggle('paused', !on);
+  if (on) armHide(); else $('vp').classList.remove('clean');
+  syncSession();
+}
+$('ppB').onclick = togglePlay;
+$('nextB').onclick = () => stepTrack(1);
+$('prevB').onclick = () => stepTrack(-1);
+$('mOpen').onclick = () => { if (curKind === 'video') openPlayer(); else { showTab('p-scenes'); openSub('music'); } };
+
+/* ---- video player ---- */
+let seeking = false, hideT = null, landscape = false;
+function armHide() { clearTimeout(hideT); hideT = setTimeout(() => { if (!vid.paused) $('vp').classList.add('clean'); }, 3000); }
+function openPlayer() {
+  if (!$('vp').classList.contains('hide')) return;
+  $('vp').classList.remove('hide'); $('vp').classList.remove('clean'); armHide();
+  history.pushState({ player: 1 }, '');
+  if (NATIVE) Strip.immersive({ on: true, landscape }).catch(() => {});
+}
+function closePlayer(fromBack) {
+  if ($('vp').classList.contains('hide')) return;
+  $('vp').classList.add('hide');
+  if (NATIVE) Strip.immersive({ on: false }).catch(() => {});
+  if (!fromBack && history.state && history.state.player) history.back();
+}
+$('vp').addEventListener('click', (e) => {
+  if (e.target.closest('.vb') || e.target.closest('.vseek')) { armHide(); return; }
+  if (vid.paused) { togglePlay(); return; }
+  $('vp').classList.toggle('clean'); if (!$('vp').classList.contains('clean')) armHide();
+});
+$('vClose').onclick = () => closePlayer(false);
+$('vPlay').onclick = togglePlay;
+$('vPrev').onclick = () => stepTrack(-1);
+$('vNext').onclick = () => stepTrack(1);
+$('vBack').onclick = () => { vid.currentTime = Math.max(0, vid.currentTime - 10); };
+$('vFwd').onclick = () => { vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 10); };
+$('vRot').onclick = () => { landscape = !landscape; if (NATIVE) Strip.immersive({ on: true, landscape }).catch(() => {}); };
+$('vSeek').addEventListener('input', () => { seeking = true; if (vid.duration) $('vCur').textContent = fmt(($('vSeek').value / 1000) * vid.duration * 1000); });
+$('vSeek').addEventListener('change', () => { if (vid.duration) vid.currentTime = ($('vSeek').value / 1000) * vid.duration; seeking = false; armHide(); });
+
+/* ---- library controls ---- */
+document.querySelectorAll('#libSeg button').forEach((b) => (b.onclick = () => {
+  if (S.lib === b.dataset.k) return;
+  S.lib = b.dataset.k; save(); openFolder = null; view = 'folders';
+  document.querySelectorAll('#libSeg button').forEach((x) => x.classList.toggle('sel', x === b));
+  loadLibrary();
+}));
 document.querySelectorAll('#musicSeg button').forEach((b) => (b.onclick = () => { view = b.dataset.m; openFolder = null;
   document.querySelectorAll('#musicSeg button').forEach((x) => x.classList.toggle('sel', x === b));
-  if (LIB) renderList(); else loadLibrary(); }));
+  if (LIBS[S.lib]) renderList(); else loadLibrary(); }));
+$('sortSel').value = S.sort;
+$('sortSel').onchange = () => { S.sort = $('sortSel').value; save(); if (LIBS[S.lib]) renderList(); };
+$('q').addEventListener('input', () => { query = $('q').value; if (LIBS[S.lib]) renderList(); });
+document.querySelectorAll('#libSeg button').forEach((x) => x.classList.toggle('sel', x.dataset.k === S.lib));
+
+/* ---- notification, lock screen and headset controls ---- */
+let lastSession = '';
+function syncSession(force) {
+  if (!NATIVE) return;
+  const x = queueItems[qi];
+  const m = curKind ? el() : null;
+  const st = { on: BLE.connected || !!curKind, bt: BLE.connected, media: !!curKind, playing: !!m && !m.paused,
+    light: S.power && S.bright > 0, title: x ? x.title : '', artist: x ? (x.artist || (curKind === 'video' ? 'Video' : '')) : '',
+    duration: m && isFinite(m.duration) ? Math.round(m.duration * 1000) : 0 };
+  const key = JSON.stringify(st); if (key === lastSession && !force) return; lastSession = key;
+  st.position = m ? Math.round(m.currentTime * 1000) : 0;          // lets the system seek bar move on its own
+  Strip.session(st).catch(() => {});
+}
+if (NATIVE) Strip.addListener('media', ({ action }) => {
+  if (action === 'toggle') togglePlay();
+  else if (action === 'next') stepTrack(1);
+  else if (action === 'prev') stepTrack(-1);
+  else if (action === 'power') { if (S.bright === 0) setNum('bright', 60); S.power = !S.power; save(); paintPower(); }
+  else if (action.startsWith('seek:') && curKind) { el().currentTime = (+action.slice(5) || 0) / 1000; }
+});
+// Keep the system seek bar in step after seeking, metadata loading, and every 15 s while playing.
+[au, vid].forEach((m) => {
+  m.addEventListener('seeked', () => { if (m === el()) syncSession(true); });
+  m.addEventListener('loadedmetadata', () => { if (m === el()) syncSession(true); });
+});
+setInterval(() => { if (curKind && !el().paused) syncSession(true); }, 15000);
 
 /* ---------------- music style + pulse ---------------- */
 const HINT = { disco: 'Disco: kick drums go red, vocals green, cymbals blue.', flow: 'Flow: colors glide around the wheel and jump on every beat.' };
@@ -396,27 +577,33 @@ function clearSel() { document.querySelectorAll('.fx.sel,.gt.sel,.rc.sel').forEa
 const NUM = { bright: ['brR', 'brN'], speed: ['spR', 'spN'], sens: ['snR', 'snN'] };
 function setNum(k, v) {
   v = clamp(Math.round(+v || 0), 0, 100); S[k] = v;
-  $(NUM[k][0]).value = v; $(NUM[k][1]).value = v;
-  if (k === 'bright') { $('qbR').value = v; $('qbN').textContent = v; if (v > 0 && !S.power) { S.power = true; paintPower(); } }
+  $(NUM[k][0]).value = v; if (document.activeElement !== $(NUM[k][1])) $(NUM[k][1]).value = v;
+  if (k === 'bright') { $('qbR').value = v; if (document.activeElement !== $('qbN')) $('qbN').value = v; if (v > 0 && !S.power) S.power = true; paintPower(); }
   save();
+}
+function numField(input, k) {
+  input.addEventListener('focus', () => { input.select(); setTimeout(() => input.select(), 0); });
+  input.addEventListener('input', () => { if (input.value !== '' && !isNaN(+input.value)) setNum(k, input.value); });   // live while typing
+  const done = () => { setNum(k, input.value === '' ? S[k] : input.value); input.value = S[k]; };
+  input.addEventListener('change', done); input.addEventListener('blur', done);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
 }
 Object.keys(NUM).forEach((k) => {
   $(NUM[k][0]).addEventListener('input', (e) => setNum(k, e.target.value));
-  $(NUM[k][1]).addEventListener('change', (e) => setNum(k, e.target.value));
-  $(NUM[k][1]).addEventListener('focus', (e) => e.target.select());
+  numField($(NUM[k][1]), k);
 });
-document.querySelectorAll('.ar button').forEach((b) => (b.onclick = () => setNum(b.dataset.k, S[b.dataset.k] + +b.dataset.d)));
+numField($('qbN'), 'bright');
 $('qbR').addEventListener('input', (e) => setNum('bright', e.target.value));
 
 /* ---------------- power + connection ---------------- */
-function paintPower() { $('pwr').classList.toggle('on', S.power && S.bright > 0); }
+function paintPower() { $('pwr').classList.toggle('on', S.power && S.bright > 0); if (typeof syncSession === 'function') syncSession(); }
 $('pwr').onclick = () => {
   if (S.bright === 0) setNum('bright', 60);
   S.power = !S.power; save(); paintPower();
   toast(S.power ? 'Strip on' : 'Strip off');
 };
 function setStatus(on) { $('status').classList.toggle('on', on); $('statusTxt').textContent = on ? 'Connected' : 'Tap to connect'; }
-function onLost() { BLE.connected = false; stripOn = null; setStatus(false); if (NATIVE) Strip.keepAlive({ on: false }).catch(() => {}); toast('Strip disconnected'); }
+function onLost() { BLE.connected = false; stripOn = null; setStatus(false); syncSession(); toast('Strip disconnected'); }
 
 const MSG = {
   BT_OFF: 'Bluetooth is off. Turn it on to connect.',
@@ -438,7 +625,7 @@ async function doConnect(fromWelcome) {
   try {
     await BLE.connect();
     stripOn = null; lastSent = ''; setStatus(true); $('welcome').classList.add('hide'); $('wmsg').textContent = '';
-    if (NATIVE) { Strip.keepAlive({ on: true }).catch(() => {}); syncRoutines(); }
+    syncSession(); syncRoutines();
     if (!fromWelcome) toast('Connected');
   } catch (e) {
     const code = (e && (e.code || e.message)) || '';
@@ -474,7 +661,7 @@ function closeSheet() { $('sheet').classList.add('hide'); }
 $('sheet').onclick = (e) => { if (e.target.id === 'sheet') closeSheet(); };
 async function endSession(msg) {
   await BLE.disconnect(); stripOn = null; setStatus(false);
-  if (NATIVE) Strip.keepAlive({ on: false }).catch(() => {});
+  syncSession();
   toast(msg);
 }
 $('status').onclick = () => {
@@ -506,7 +693,10 @@ function closeSub(silent) {
   sub = null; $('sc-main').hidden = false; $('sc-music').hidden = true; $('sc-voice').hidden = true;
   if (!silent && history.state && history.state.sub) history.back();
 }
-window.addEventListener('popstate', () => { if (sub) { const s = sub; sub = null; closeSubFromBack(s); } });
+window.addEventListener('popstate', () => {
+  if (!$('vp').classList.contains('hide')) { closePlayer(true); return; }
+  if (sub) { const s = sub; sub = null; closeSubFromBack(s); }
+});
 function closeSubFromBack(s) {
   if (s === 'voice') { stopMic(); if (mode === 'voice') solid(false); }
   if (s === 'music' && !NATIVE) { stopMic(); if (mode === 'music') solid(false); }
