@@ -13,8 +13,6 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
         try {
             if (getBridge() != null) {
-                // Songs and videos with correct byte ranges (seeking, every MP4 loads).
-                getBridge().setWebViewClient(new MediaWebViewClient(getBridge()));
                 WebView wv = getBridge().getWebView();
                 if (wv != null) {
                     wv.getSettings().setMediaPlaybackRequiresUserGesture(false);

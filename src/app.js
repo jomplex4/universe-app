@@ -17,7 +17,7 @@ const $ = (id) => document.getElementById(id);
 
 /* ---------------- state ---------------- */
 const S = Object.assign(
-  { r: 225, g: 6, b: 0, bright: 100, speed: 50, sens: 70, power: true, lastId: null, mstyle: 'disco', pulse: false },
+  { r: 225, g: 6, b: 0, bright: 100, speed: 50, sens: 70, power: true, lastId: null, mstyle: 'disco' },
   load('u_state') || {}
 );
 function save() { localStorage.setItem('u_state', JSON.stringify(S)); }
@@ -126,7 +126,6 @@ let gen = () => [S.r, S.g, S.b];
 let ease = 0.5;              // 1 = hard cut, lower = smoother
 let t0 = performance.now();
 let lastSent = '';
-let pulseK = 1;               // only the optional Pulse switch may move intensity
 let stripOn = null;          // what the strip currently is (power)
 const rate = () => 0.15 + (S.speed / 100) * 1.85;
 
@@ -156,7 +155,7 @@ function tick() {
   if (now - lastSendAt > 2500) lastSent = '';                                                       // idle heartbeat
   // Keep intensity locked to the target: blending two hues must never dim the strip.
   const tm = mode === 'solid' ? Math.max(target[0], target[1], target[2]) : 255, om = Math.max(out[0], out[1], out[2]);
-  const k = (S.bright / 100) * (om > 1 && tm > 0 ? tm / om : 1) * (mode === 'music' ? pulseK : 1);
+  const k = (S.bright / 100) * (om > 1 && tm > 0 ? tm / om : 1);
   const c = out.map((x) => clamp(Math.round(x * k), 0, 255));
   const key = c.join(',');
   if (key !== lastSent) { lastSent = key; sendColor(c); }
@@ -164,7 +163,7 @@ function tick() {
 setInterval(tick, 50);
 window.__ut = tick;               // the APK calls this while in the background
 
-function setMode(m, g, e) { mode = m; gen = g; ease = e; pulseK = 1; t0 = performance.now(); if (m !== 'voice') stopMic(); }
+function setMode(m, g, e) { mode = m; gen = g; ease = e; t0 = performance.now(); if (m !== 'voice') stopMic(); }
 function solid(fromUser) {
   const base = [S.r, S.g, S.b];
   setMode('solid', () => base, fromUser ? 0.55 : 1);
@@ -199,13 +198,13 @@ const SCENES = [
 ];
 
 /* ---------------- audio (music playback + voice mic) ---------------- */
-let actx = null, analyser = null, buf = null, mediaSrc = null, micStream = null, micSrc = null;
+let actx = null, analyser = null, buf = null, tbuf = null, mediaSrc = null, micStream = null, micSrc = null;
 function audioCtx() {
   if (!actx) {
     actx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = actx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.35;
     analyser.minDecibels = -90; analyser.maxDecibels = -10;   // wide range: loud music never saturates
-    buf = new Uint8Array(analyser.frequencyBinCount);
+    buf = new Uint8Array(analyser.frequencyBinCount); tbuf = new Float32Array(analyser.fftSize);
   }
   if (actx.state === 'suspended') actx.resume();
   return actx;
@@ -222,7 +221,11 @@ function reactiveGen(kind) {
     analyser.getByteFrequencyData(buf);
     const s = 0.4 + (S.sens / 100) * 1.6;
     if (kind === 'voice') {
-      const raw = clamp(band(2, 60) * s * 1.8, 0, 1);
+      // Loudness in real decibels (independent of the analyser's display range).
+      analyser.getFloatTimeDomainData(tbuf);
+      let sum = 0; for (let i = 0; i < tbuf.length; i++) sum += tbuf[i] * tbuf[i];
+      const db = 20 * Math.log10(Math.sqrt(sum / tbuf.length) + 1e-9);   // speech is about -45 (soft) to -15 dB (loud)
+      const raw = clamp(((db + 52) / 40) * s * 0.75, 0, 1);
       lvl += (raw - lvl) * (raw > lvl ? 0.5 : 0.1);
       paintTicks(lvl);
       return wheelAt(3 / 7 + lvl * (4 / 7)); // quiet = blue, loud = red
@@ -233,7 +236,6 @@ function reactiveGen(kind) {
     const energy = (bass + mid + high) / 3;
     avgBass += (bass - avgBass) * 0.03; avgMid += (mid - avgMid) * 0.03; avgHigh += (high - avgHigh) * 0.03;
     const loud = clamp(energy * s * 2.4, 0, 1);
-    pulseK = S.pulse ? (pulseK += ((0.22 + 0.78 * loud) - pulseK) * 0.5) : 1;
     // Beat = sudden NEW energy in the low end (spectral flux), robust with any mix or volume.
     let flux = 0; const b0 = hz(40), b1 = hz(160) + 1;
     for (let i = b0; i < b1; i++) { const d = buf[i] - prev[i]; if (d > 0) flux += d; }
@@ -304,7 +306,8 @@ const srcNode = new Map();                  // one Web Audio source per element
 let view = 'folders', openFolder = null, queueItems = [], qi = -1, curKind = null, query = '';
 S.lib = S.lib || 'audio'; S.sort = S.sort || 'az';
 const el = () => (curKind === 'video' ? vid : au);
-const mediaUrl = (path) => (NATIVE ? '/_media/' + encodeURIComponent(path) : path);
+// Capacitor serves the whole file and Android's web engine applies the byte range itself.
+const mediaUrl = (path) => (NATIVE ? Capacitor.convertFileSrc(path) : path);
 
 function wireMedia(m) {
   audioCtx();
@@ -317,13 +320,13 @@ async function loadLibrary() {
   if (!NATIVE) {
     $('libSeg').hidden = true; $('musicSeg').hidden = true; $('mlist').innerHTML = '';
     document.querySelector('.tools').hidden = true;
-    $('musicSub').textContent = 'Songs and videos play in the Android app. Here, the strip follows the sound around you.';
+    $('musicSub').textContent = 'Music and karaoke play in the Android app. Here, the strip follows the sound around you.';
     startMicMusic(); return;
   }
   if (LIBS[kind]) { renderList(); return; }
   if (loading[kind]) return;
   loading[kind] = true;
-  $('mlist').innerHTML = '<div class="empty">' + (kind === 'video' ? 'Reading your videos...' : 'Reading your music...') + '</div>';
+  $('mlist').innerHTML = '<div class="empty">' + (kind === 'video' ? 'Reading your karaoke videos...' : 'Reading your music...') + '</div>';
   const p = MusicLibrary.getLibrary({ kind });
   p.then((r) => { LIBS[kind] = r.folders || []; if (sub === 'music' && S.lib === kind) renderList(); }).catch(() => {});
   try { await withTimeout(p, 30000); }
@@ -370,10 +373,10 @@ function sortFolders(list) {
 }
 function renderList() {
   const lib = LIBS[S.lib], box = $('mlist'), isV = S.lib === 'video';
-  $('allTab').textContent = isV ? 'All videos' : 'All songs';
+  $('allTab').textContent = isV ? 'All karaoke' : 'All songs';
   document.querySelectorAll('#musicSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.m === (openFolder ? 'folders' : view)));
   if (!lib) return;
-  if (!lib.length) { box.innerHTML = '<div class="empty">' + (isV ? 'No videos found on this phone.' : 'No songs found on this phone.') + '</div>'; return; }
+  if (!lib.length) { box.innerHTML = '<div class="empty">' + (isV ? 'No karaoke videos found on this phone.' : 'No songs found on this phone.') + '</div>'; return; }
   const q = query.trim().toLowerCase();
   if (view === 'folders' && !openFolder && !q) {
     const fs = sortFolders(lib);
@@ -386,7 +389,7 @@ function renderList() {
   items = sortItems(items);
   const head = openFolder ? '<button class="back" id="upF"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg> ' + esc(openFolder.name) + '</button>' : '';
   const cur = queueItems[qi];
-  box.innerHTML = head + (items.length ? items.map((x, i) => '<button class="li' + (cur && cur.path === x.path ? ' play' : '') + '" data-s="' + i + '"><div class="ic' + (isV ? ' v' : '') + '">' + (isV ? IC_VIDEO : IC_NOTE) + '</div><div class="m"><div class="t">' + esc(x.title) + '</div><div class="d">' + esc(x.artist || (isV ? 'Video' : '')) + '</div></div><div class="du">' + fmt(x.duration) + '</div></button>').join('')
+  box.innerHTML = head + (items.length ? items.map((x, i) => '<button class="li' + (cur && cur.path === x.path ? ' play' : '') + '" data-s="' + i + '"><div class="ic' + (isV ? ' v' : '') + '">' + (isV ? IC_VIDEO : IC_NOTE) + '</div><div class="m"><div class="t">' + esc(x.title) + '</div><div class="d">' + esc(x.artist || (isV ? 'Karaoke' : '')) + '</div></div><div class="du">' + fmt(x.duration) + '</div></button>').join('')
     : '<div class="empty">Nothing matches your search.</div>');
   if (openFolder) $('upF').onclick = () => { openFolder = null; renderList(); };
   box.querySelectorAll('[data-s]').forEach((b) => (b.onclick = () => { queueItems = items; playAt(+b.dataset.s, S.lib); }));
@@ -424,7 +427,7 @@ function stepTrack(d) {
     const pct = (m.currentTime / m.duration) * 100;
     $('progI').style.width = pct + '%';
     $('nowD').textContent = fmt(m.currentTime * 1000) + ' / ' + fmt(m.duration * 1000);
-    if (m === vid && !seeking) { $('vSeek').value = Math.round(pct * 10); $('vCur').textContent = fmt(m.currentTime * 1000); $('vDur').textContent = fmt(m.duration * 1000); }
+    if (m === vid && !seeking) { $('vSeek').value = Math.round(pct * 10); paintSeek(pct); $('vCur').textContent = fmt(m.currentTime * 1000); $('vDur').textContent = '-' + fmt((m.duration - m.currentTime) * 1000); }
   });
   m.addEventListener('play', () => { if (m === el()) paintPlay(true); });
   m.addEventListener('pause', () => { if (m === el()) paintPlay(false); });
@@ -432,8 +435,7 @@ function stepTrack(d) {
 });
 function paintPlay(on) {
   const I = on ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M7 5v14l12-7z"/>';
-  $('ppI').innerHTML = I; $('vPlayI').innerHTML = on ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M8 5v14l11-7z"/>';
-  $('vp').classList.toggle('paused', !on);
+  $('ppI').innerHTML = I; $('vPlayI').innerHTML = on ? '<path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/>' : '<path d="M8.5 5v14l11-7z"/>';
   if (on) armHide(); else $('vp').classList.remove('clean');
   syncSession();
 }
@@ -442,14 +444,17 @@ $('nextB').onclick = () => stepTrack(1);
 $('prevB').onclick = () => stepTrack(-1);
 $('mOpen').onclick = () => { if (curKind === 'video') openPlayer(); else { showTab('p-scenes'); openSub('music'); } };
 
-/* ---- video player ---- */
-let seeking = false, hideT = null, landscape = false;
-function armHide() { clearTimeout(hideT); hideT = setTimeout(() => { if (!vid.paused) $('vp').classList.add('clean'); }, 3000); }
+/* ---- karaoke player ---- */
+let seeking = false, hideT = null;
+const FIT_I = '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>';
+const FILL_I = '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>';
+function armHide() { clearTimeout(hideT); hideT = setTimeout(() => { if (!vid.paused && !seeking) $('vp').classList.add('clean'); }, 3200); }
+function showUi() { $('vp').classList.remove('clean'); armHide(); }
 function openPlayer() {
   if (!$('vp').classList.contains('hide')) return;
-  $('vp').classList.remove('hide'); $('vp').classList.remove('clean'); armHide();
+  $('vp').classList.remove('hide'); showUi();
   history.pushState({ player: 1 }, '');
-  if (NATIVE) Strip.immersive({ on: true, landscape }).catch(() => {});
+  if (NATIVE) Strip.immersive({ on: true, landscape: true }).catch(() => {});   // karaoke is widescreen
 }
 function closePlayer(fromBack) {
   if ($('vp').classList.contains('hide')) return;
@@ -457,19 +462,35 @@ function closePlayer(fromBack) {
   if (NATIVE) Strip.immersive({ on: false }).catch(() => {});
   if (!fromBack && history.state && history.state.player) history.back();
 }
+function skip(sec) {
+  if (!vid.duration) return;
+  vid.currentTime = clamp(vid.currentTime + sec, 0, vid.duration - 0.2);
+  const f = $(sec < 0 ? 'vFlashL' : 'vFlashR'); f.classList.add('show'); clearTimeout(f.t); f.t = setTimeout(() => f.classList.remove('show'), 450);
+}
+// Tap: show or hide controls. Double tap on the left or right third: jump 10 s.
+let lastTap = 0, lastSide = 0, tapT = null;
 $('vp').addEventListener('click', (e) => {
   if (e.target.closest('.vb') || e.target.closest('.vseek')) { armHide(); return; }
-  if (vid.paused) { togglePlay(); return; }
-  $('vp').classList.toggle('clean'); if (!$('vp').classList.contains('clean')) armHide();
+  const w = window.innerWidth, side = e.clientX < w / 3 ? -1 : e.clientX > (2 * w) / 3 ? 1 : 0;
+  const now = performance.now();
+  if (side && side === lastSide && now - lastTap < 300) { clearTimeout(tapT); lastTap = 0; skip(side * 10); return; }
+  lastTap = now; lastSide = side; clearTimeout(tapT);
+  tapT = setTimeout(() => { if ($('vp').classList.contains('clean')) showUi(); else if (!vid.paused) $('vp').classList.add('clean'); }, side ? 260 : 0);
 });
 $('vClose').onclick = () => closePlayer(false);
 $('vPlay').onclick = togglePlay;
 $('vPrev').onclick = () => stepTrack(-1);
 $('vNext').onclick = () => stepTrack(1);
-$('vBack').onclick = () => { vid.currentTime = Math.max(0, vid.currentTime - 10); };
-$('vFwd').onclick = () => { vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 10); };
-$('vRot').onclick = () => { landscape = !landscape; if (NATIVE) Strip.immersive({ on: true, landscape }).catch(() => {}); };
-$('vSeek').addEventListener('input', () => { seeking = true; if (vid.duration) $('vCur').textContent = fmt(($('vSeek').value / 1000) * vid.duration * 1000); });
+$('vBack').onclick = () => skip(-10);
+$('vFwd').onclick = () => skip(10);
+$('vFit').onclick = () => {
+  const fill = $('vp').classList.toggle('fill');
+  $('vFitI').innerHTML = fill ? FILL_I : FIT_I;
+  toast(fill ? 'Fill screen' : 'Fit to screen');
+};
+function paintSeek(pct) { $('vSeek').style.setProperty('--p', pct + '%'); }
+$('vSeek').addEventListener('input', () => { seeking = true; showUi(); paintSeek($('vSeek').value / 10);
+  if (vid.duration) $('vCur').textContent = fmt(($('vSeek').value / 1000) * vid.duration * 1000); });
 $('vSeek').addEventListener('change', () => { if (vid.duration) vid.currentTime = ($('vSeek').value / 1000) * vid.duration; seeking = false; armHide(); });
 
 /* ---- library controls ---- */
@@ -494,7 +515,7 @@ function syncSession(force) {
   const x = queueItems[qi];
   const m = curKind ? el() : null;
   const st = { on: BLE.connected || !!curKind, bt: BLE.connected, media: !!curKind, playing: !!m && !m.paused,
-    light: S.power && S.bright > 0, title: x ? x.title : '', artist: x ? (x.artist || (curKind === 'video' ? 'Video' : '')) : '',
+    light: S.power && S.bright > 0, title: x ? x.title : '', artist: x ? (x.artist || (curKind === 'video' ? 'Karaoke' : '')) : '',
     duration: m && isFinite(m.duration) ? Math.round(m.duration * 1000) : 0 };
   const key = JSON.stringify(st); if (key === lastSession && !force) return; lastSession = key;
   st.position = m ? Math.round(m.currentTime * 1000) : 0;          // lets the system seek bar move on its own
@@ -514,15 +535,13 @@ if (NATIVE) Strip.addListener('media', ({ action }) => {
 });
 setInterval(() => { if (curKind && !el().paused) syncSession(true); }, 15000);
 
-/* ---------------- music style + pulse ---------------- */
-const HINT = { disco: 'Disco: kick drums go red, vocals green, cymbals blue.', flow: 'Flow: colors glide around the wheel and jump on every beat.' };
+/* ---------------- music style ---------------- */
+const HINT = { disco: 'Disco: smooth on calm songs, hard cuts on strong beats.', flow: 'Flow: colors glide around the wheel and jump on every beat.' };
 function paintStyle() {
   document.querySelectorAll('#styleSeg button').forEach((b) => b.classList.toggle('sel', b.dataset.st === S.mstyle));
-  $('pulseB').querySelector('.sw').classList.toggle('off', !S.pulse);
-  $('styleHint').textContent = HINT[S.mstyle] + (S.pulse ? ' Pulse makes the light breathe with the volume.' : '');
+  $('styleHint').textContent = HINT[S.mstyle];
 }
 document.querySelectorAll('#styleSeg button').forEach((b) => (b.onclick = () => { S.mstyle = b.dataset.st; save(); paintStyle(); }));
-$('pulseB').onclick = () => { S.pulse = !S.pulse; save(); paintStyle(); };
 paintStyle();
 
 /* ---------------- UI: color ---------------- */
@@ -574,10 +593,10 @@ document.querySelectorAll('.fx').forEach((b) => (b.onclick = () => {
 function clearSel() { document.querySelectorAll('.fx.sel,.gt.sel,.rc.sel').forEach((x) => x.classList.remove('sel')); }
 
 /* ---------------- UI: numeric controls ---------------- */
-const NUM = { bright: ['brR', 'brN'], speed: ['spR', 'spN'], sens: ['snR', 'snN'] };
+const NUM = { speed: ['spR', 'spN'], sens: ['snR', 'snN'] };
 function setNum(k, v) {
   v = clamp(Math.round(+v || 0), 0, 100); S[k] = v;
-  $(NUM[k][0]).value = v; if (document.activeElement !== $(NUM[k][1])) $(NUM[k][1]).value = v;
+  if (NUM[k]) { $(NUM[k][0]).value = v; if (document.activeElement !== $(NUM[k][1])) $(NUM[k][1]).value = v; }
   if (k === 'bright') { $('qbR').value = v; if (document.activeElement !== $('qbN')) $('qbN').value = v; if (v > 0 && !S.power) S.power = true; paintPower(); }
   save();
 }
@@ -762,7 +781,7 @@ function routineCheck() {
 
 /* ---------------- toast + boot ---------------- */
 function toast(m) { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(t.h); t.h = setTimeout(() => t.classList.remove('show'), 2200); }
-Object.keys(NUM).forEach((k) => setNum(k, S[k]));
+Object.keys(NUM).forEach((k) => setNum(k, S[k])); setNum('bright', S.bright);
 showColor([S.r, S.g, S.b]); paintPower(); renderRT(); setStatus(false); solid(false);
 if (NATIVE) $('rtHint').textContent = 'Routines also run when the app is closed, as long as Bluetooth is on.';
 requestAnimationFrame(placeHandle);
