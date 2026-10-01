@@ -13,11 +13,12 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 const NATIVE = Capacitor.isNativePlatform();
 const MusicLibrary = registerPlugin('MusicLibrary');
 const Strip = registerPlugin('Strip');   // our own native Bluetooth (APK)
+const Player = registerPlugin('Player');  // native player: ExoPlayer, same engine as COMET (APK)
 const $ = (id) => document.getElementById(id);
 
 /* ---------------- state ---------------- */
 const S = Object.assign(
-  { r: 225, g: 6, b: 0, bright: 100, speed: 50, sens: 70, power: true, lastId: null, mstyle: 'disco' },
+  { r: 225, g: 6, b: 0, bright: 100, speed: 50, sens: 70, power: true, lastId: null, mstyle: 'disco', sync: 150 },
   load('u_state') || {}
 );
 function save() { localStorage.setItem('u_state', JSON.stringify(S)); }
@@ -209,16 +210,17 @@ function audioCtx() {
   if (actx.state === 'suspended') actx.resume();
   return actx;
 }
-const band = (a, b) => { let s = 0; for (let i = a; i < b; i++) s += buf[i]; return s / (b - a) / 255; };
 
 const CLUB = [[255,0,0],[0,70,255],[255,0,200],[0,255,200],[255,140,0],[140,0,255],[0,255,40],[255,0,70]];
 function reactiveGen(kind) {
   let hue = rgbHsv(S.r, S.g, S.b)[0], avgBass = 0.1, avgMid = 0.1, avgHigh = 0.1, lastBeat = 0, lvl = 0, kick = 0;
-  let hard = 0, punch = 1, ci = 0, avgFlux = 0.01; const beats = []; const prev = new Uint8Array(buf ? buf.length : 256);
+  let hard = 0, punch = 1, ci = 0, avgFlux = 0.01; const beats = []; let prev = new Uint8Array(256);
   let last = [255, 0, 0];
+  const nat = NATIVE && kind === 'music';          // songs and karaoke: the player's own audio, not the microphone
   return (t) => {
-    if (!analyser) return hsvRgb(hue, 1, 1);
-    analyser.getByteFrequencyData(buf);
+    let B, sr;
+    if (nat) { B = nativeSpectrum(); if (!B) return last; sr = specRate; }
+    else { if (!analyser) return hsvRgb(hue, 1, 1); analyser.getByteFrequencyData(buf); B = buf; sr = actx.sampleRate; }
     const s = 0.4 + (S.sens / 100) * 1.6;
     if (kind === 'voice') {
       // Loudness in real decibels (independent of the analyser's display range).
@@ -231,16 +233,18 @@ function reactiveGen(kind) {
       return wheelAt(3 / 7 + lvl * (4 / 7)); // quiet = blue, loud = red
     }
     // Real frequency bands from the sample rate: 60-250 Hz, 250-2000 Hz, 2000-10000 Hz
-    const hz = (f) => clamp(Math.round((f / (actx.sampleRate / 2)) * buf.length), 1, buf.length - 1);
+    const hz = (f) => clamp(Math.round((f / (sr / 2)) * B.length), 1, B.length - 1);
+    const band = (a, b) => { let sum = 0; for (let i = a; i < b; i++) sum += B[i]; return sum / (b - a) / 255; };
+    if (prev.length !== B.length) prev = new Uint8Array(B.length);
     const bass = band(hz(60), hz(250) + 1), mid = band(hz(250), hz(2000)), high = band(hz(2000), hz(10000));
     const energy = (bass + mid + high) / 3;
     avgBass += (bass - avgBass) * 0.03; avgMid += (mid - avgMid) * 0.03; avgHigh += (high - avgHigh) * 0.03;
     const loud = clamp(energy * s * 2.4, 0, 1);
     // Beat = sudden NEW energy in the low end (spectral flux), robust with any mix or volume.
     let flux = 0; const b0 = hz(40), b1 = hz(160) + 1;
-    for (let i = b0; i < b1; i++) { const d = buf[i] - prev[i]; if (d > 0) flux += d; }
+    for (let i = b0; i < b1; i++) { const d = B[i] - prev[i]; if (d > 0) flux += d; }
     flux /= (b1 - b0) * 255;
-    prev.set(buf);
+    prev.set(B);
     avgFlux += (flux - avgFlux) * 0.05;
     const beat = flux > avgFlux * 2 + 0.02 && t - lastBeat > 0.2;
     if (beat) lastBeat = t;
@@ -288,7 +292,7 @@ function reactiveGen(kind) {
 
 async function startVoice() {
   try {
-    audioCtx(); [au, vid].forEach((m) => { if (!m.paused) m.pause(); });
+    audioCtx(); if (NATIVE && MS.playing) Player.toggle().catch(() => {});
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
     micSrc = actx.createMediaStreamSource(micStream); micSrc.connect(analyser);
     setMode('voice', reactiveGen('voice'), 0.35); clearSel(); $('rcVoice').classList.add('sel');
@@ -300,19 +304,10 @@ function stopMic() {
 }
 
 /* ---------------- media library + player (songs and videos) ---------------- */
-const au = $('au'), vid = $('vid');
 const LIBS = { audio: null, video: null };
-const srcNode = new Map();                  // one Web Audio source per element
 let view = 'folders', openFolder = null, queueItems = [], qi = -1, curKind = null, query = '';
 S.lib = S.lib || 'audio'; S.sort = S.sort || 'az';
-const el = () => (curKind === 'video' ? vid : au);
-// Capacitor serves the whole file and Android's web engine applies the byte range itself.
-const mediaUrl = (path) => (NATIVE ? Capacitor.convertFileSrc(path) : path);
-
-function wireMedia(m) {
-  audioCtx();
-  if (!srcNode.has(m)) { const n = actx.createMediaElementSource(m); n.connect(actx.destination); n.connect(analyser); srcNode.set(m, n); }
-}
+if (typeof S.sync !== 'number') S.sync = 150;
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(err('TIMEOUT')), ms))]);
 const loading = { audio: false, video: false };
 async function loadLibrary() {
@@ -321,6 +316,7 @@ async function loadLibrary() {
     $('libSeg').hidden = true; $('musicSeg').hidden = true; $('mlist').innerHTML = '';
     document.querySelector('.tools').hidden = true;
     $('musicSub').textContent = 'Music and karaoke play in the Android app. Here, the strip follows the sound around you.';
+    $('syncRow').hidden = true; $('syncHint').hidden = true;
     startMicMusic(); return;
   }
   if (LIBS[kind]) { renderList(); return; }
@@ -395,103 +391,68 @@ function renderList() {
   box.querySelectorAll('[data-s]').forEach((b) => (b.onclick = () => { queueItems = items; playAt(+b.dataset.s, S.lib); }));
 }
 
+/* ---- native player (ExoPlayer in the APK): songs and karaoke videos ---- */
+let MS = { playing: false, path: '', title: '', artist: '', position: 0, duration: 0, kind: null, count: 0 };   // last state the player reported
+
+function paintMini(m) {
+  $('mini').classList.remove('hide');
+  $('nowT').textContent = m.title || '';
+  $('mArt').innerHTML = m.kind === 'video' ? IC_VIDEO : IC_NOTE;
+  const dur = m.duration || 0, pos = m.position || 0;
+  $('progI').style.width = (dur ? Math.min(100, (pos / dur) * 100) : 0) + '%';
+  $('nowD').textContent = dur ? fmt(pos) + ' / ' + fmt(dur) : (m.kind === 'video' ? 'Karaoke' : '');
+  $('ppI').innerHTML = m.playing ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M7 5v14l12-7z"/>';
+}
+function onPlayerState(m) {
+  if (!m || !m.count) { MS = { playing: false, count: 0 }; curKind = null; $('mini').classList.add('hide'); syncSession(); return; }
+  MS = m; curKind = m.kind;
+  if (m.index !== qi && m.index >= 0 && m.index < queueItems.length) { qi = m.index; if (sub === 'music') renderList(); }   // next song, headset buttons...
+  paintMini(m);
+}
 function playAt(i, kind) {
-  if (!queueItems.length) return;
+  if (!NATIVE || !queueItems.length) return;
   kind = kind || curKind || 'audio';
   qi = (i + queueItems.length) % queueItems.length;
   const x = queueItems[qi];
-  const other = kind === 'video' ? au : vid;
-  if (!other.paused) other.pause();
-  if (curKind && curKind !== kind) other.removeAttribute('src');
   curKind = kind; stopMic();
-  const m = el(); wireMedia(m);
-  m.src = mediaUrl(x.path);
-  m.play().catch(() => toast('This file could not be played'));
+  Player.play({ kind, index: qi, items: queueItems.map((q) => ({ uri: q.uri, path: q.path, title: q.title, artist: q.artist })) })
+    .catch(() => toast('This file could not be played'));
   mode = 'music'; gen = reactiveGen('music'); ease = 0.45; clearSel(); $('rcMusic').classList.add('sel');
-  $('nowT').textContent = x.title; $('vTitle').textContent = x.title;
-  $('mArt').innerHTML = kind === 'video' ? IC_VIDEO : IC_NOTE;
-  $('mini').classList.remove('hide');
-  if (kind === 'video') openPlayer();
+  paintMini({ title: x.title, kind, playing: true, position: 0, duration: x.duration });
   if (sub === 'music') renderList();
-  syncSession();
 }
-function togglePlay() { if (!curKind) return; const m = el(); if (m.paused) { audioCtx(); m.play(); } else m.pause(); }
-function stepTrack(d) {
-  if (!curKind) return;
-  const m = el();
-  if (d < 0 && m.currentTime > 3) { m.currentTime = 0; return; }
-  playAt(qi + d);
+if (NATIVE) {
+  Player.addListener('state', onPlayerState);
+  Player.addListener('error', () => toast('This file could not be played'));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) Player.getState().then(onPlayerState).catch(() => {}); });
 }
-[au, vid].forEach((m) => {
-  m.addEventListener('timeupdate', () => { if (m !== el() || !m.duration) return;
-    const pct = (m.currentTime / m.duration) * 100;
-    $('progI').style.width = pct + '%';
-    $('nowD').textContent = fmt(m.currentTime * 1000) + ' / ' + fmt(m.duration * 1000);
-    if (m === vid && !seeking) { $('vSeek').value = Math.round(pct * 10); paintSeek(pct); $('vCur').textContent = fmt(m.currentTime * 1000); $('vDur').textContent = '-' + fmt((m.duration - m.currentTime) * 1000); }
-  });
-  m.addEventListener('play', () => { if (m === el()) paintPlay(true); });
-  m.addEventListener('pause', () => { if (m === el()) paintPlay(false); });
-  m.addEventListener('ended', () => { if (m === el()) playAt(qi + 1); });
-});
-function paintPlay(on) {
-  const I = on ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M7 5v14l12-7z"/>';
-  $('ppI').innerHTML = I; $('vPlayI').innerHTML = on ? '<path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/>' : '<path d="M8.5 5v14l11-7z"/>';
-  if (on) armHide(); else $('vp').classList.remove('clean');
-  syncSession();
-}
-$('ppB').onclick = togglePlay;
-$('nextB').onclick = () => stepTrack(1);
-$('prevB').onclick = () => stepTrack(-1);
-$('mOpen').onclick = () => { if (curKind === 'video') openPlayer(); else { showTab('p-scenes'); openSub('music'); } };
+$('ppB').onclick = () => { if (!NATIVE || !curKind) return; if (curKind === 'video' && !MS.playing) Player.openVideo(); Player.toggle(); };
+$('nextB').onclick = () => { if (NATIVE && curKind) Player.next(); };
+$('prevB').onclick = () => { if (NATIVE && curKind) Player.prev(); };
+$('mOpen').onclick = () => { if (curKind === 'video') Player.openVideo(); else { showTab('p-scenes'); openSub('music'); } };
 
-/* ---- karaoke player ---- */
-let seeking = false, hideT = null;
-const FIT_I = '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>';
-const FILL_I = '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>';
-function armHide() { clearTimeout(hideT); hideT = setTimeout(() => { if (!vid.paused && !seeking) $('vp').classList.add('clean'); }, 3200); }
-function showUi() { $('vp').classList.remove('clean'); armHide(); }
-function openPlayer() {
-  if (!$('vp').classList.contains('hide')) return;
-  $('vp').classList.remove('hide'); showUi();
-  history.pushState({ player: 1 }, '');
-  if (NATIVE) Strip.immersive({ on: true, landscape: true }).catch(() => {});   // karaoke is widescreen
-}
-function closePlayer(fromBack) {
-  if ($('vp').classList.contains('hide')) return;
-  $('vp').classList.add('hide');
-  if (NATIVE) Strip.immersive({ on: false }).catch(() => {});
-  if (!fromBack && history.state && history.state.player) history.back();
-}
-function skip(sec) {
-  if (!vid.duration) return;
-  vid.currentTime = clamp(vid.currentTime + sec, 0, vid.duration - 0.2);
-  const f = $(sec < 0 ? 'vFlashL' : 'vFlashR'); f.classList.add('show'); clearTimeout(f.t); f.t = setTimeout(() => f.classList.remove('show'), 450);
-}
-// Tap: show or hide controls. Double tap on the left or right third: jump 10 s.
-let lastTap = 0, lastSide = 0, tapT = null;
-$('vp').addEventListener('click', (e) => {
-  if (e.target.closest('.vb') || e.target.closest('.vseek')) { armHide(); return; }
-  const w = window.innerWidth, side = e.clientX < w / 3 ? -1 : e.clientX > (2 * w) / 3 ? 1 : 0;
-  const now = performance.now();
-  if (side && side === lastSide && now - lastTap < 300) { clearTimeout(tapT); lastTap = 0; skip(side * 10); return; }
-  lastTap = now; lastSide = side; clearTimeout(tapT);
-  tapT = setTimeout(() => { if ($('vp').classList.contains('clean')) showUi(); else if (!vid.paused) $('vp').classList.add('clean'); }, side ? 260 : 0);
+/* ---- what the lights hear: the audio the player is about to play, 20 times per second ---- */
+const specQ = []; let specRate = 44100, specCur = null;
+if (NATIVE) Player.addListener('spectrum', (e) => {
+  const raw = atob(e.d), a = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) a[i] = raw.charCodeAt(i);
+  specQ.push({ t: performance.now(), a }); specRate = e.sr;
+  if (specQ.length > 40) specQ.shift();
 });
-$('vClose').onclick = () => closePlayer(false);
-$('vPlay').onclick = togglePlay;
-$('vPrev').onclick = () => stepTrack(-1);
-$('vNext').onclick = () => stepTrack(1);
-$('vBack').onclick = () => skip(-10);
-$('vFwd').onclick = () => skip(10);
-$('vFit').onclick = () => {
-  const fill = $('vp').classList.toggle('fill');
-  $('vFitI').innerHTML = fill ? FILL_I : FIT_I;
-  toast(fill ? 'Fill screen' : 'Fit to screen');
-};
-function paintSeek(pct) { $('vSeek').style.setProperty('--p', pct + '%'); }
-$('vSeek').addEventListener('input', () => { seeking = true; showUi(); paintSeek($('vSeek').value / 10);
-  if (vid.duration) $('vCur').textContent = fmt(($('vSeek').value / 1000) * vid.duration * 1000); });
-$('vSeek').addEventListener('change', () => { if (vid.duration) vid.currentTime = ($('vSeek').value / 1000) * vid.duration; seeking = false; armHide(); });
+// The newest frame that is at least S.sync ms old. A Bluetooth speaker plays later than the phone
+// thinks, so delaying the light by that much puts color and sound back together.
+function nativeSpectrum() {
+  const due = performance.now() - S.sync;
+  let f = null;
+  while (specQ.length && specQ[0].t <= due) f = specQ.shift();
+  if (f) specCur = f;
+  if (specCur && performance.now() - specCur.t > 700 + S.sync) specCur = null;   // paused or stopped: let go
+  return specCur ? specCur.a : null;
+}
+
+/* ---- light sync ---- */
+$('syR').value = S.sync; $('syN').textContent = S.sync + ' ms';
+$('syR').addEventListener('input', () => { S.sync = +$('syR').value; $('syN').textContent = S.sync + ' ms'; save(); });
 
 /* ---- library controls ---- */
 document.querySelectorAll('#libSeg button').forEach((b) => (b.onclick = () => {
@@ -508,32 +469,17 @@ $('sortSel').onchange = () => { S.sort = $('sortSel').value; save(); if (LIBS[S.
 $('q').addEventListener('input', () => { query = $('q').value; if (LIBS[S.lib]) renderList(); });
 document.querySelectorAll('#libSeg button').forEach((x) => x.classList.toggle('sel', x.dataset.k === S.lib));
 
-/* ---- notification, lock screen and headset controls ---- */
+/* ---- background notification (light) ---- */
 let lastSession = '';
-function syncSession(force) {
+function syncSession() {
   if (!NATIVE) return;
-  const x = queueItems[qi];
-  const m = curKind ? el() : null;
-  const st = { on: BLE.connected || !!curKind, bt: BLE.connected, media: !!curKind, playing: !!m && !m.paused,
-    light: S.power && S.bright > 0, title: x ? x.title : '', artist: x ? (x.artist || (curKind === 'video' ? 'Karaoke' : '')) : '',
-    duration: m && isFinite(m.duration) ? Math.round(m.duration * 1000) : 0 };
-  const key = JSON.stringify(st); if (key === lastSession && !force) return; lastSession = key;
-  st.position = m ? Math.round(m.currentTime * 1000) : 0;          // lets the system seek bar move on its own
+  const st = { on: BLE.connected, light: S.power && S.bright > 0 };
+  const key = JSON.stringify(st); if (key === lastSession) return; lastSession = key;
   Strip.session(st).catch(() => {});
 }
 if (NATIVE) Strip.addListener('media', ({ action }) => {
-  if (action === 'toggle') togglePlay();
-  else if (action === 'next') stepTrack(1);
-  else if (action === 'prev') stepTrack(-1);
-  else if (action === 'power') { if (S.bright === 0) setNum('bright', 60); S.power = !S.power; save(); paintPower(); }
-  else if (action.startsWith('seek:') && curKind) { el().currentTime = (+action.slice(5) || 0) / 1000; }
+  if (action === 'power') { if (S.bright === 0) setNum('bright', 60); S.power = !S.power; save(); paintPower(); }
 });
-// Keep the system seek bar in step after seeking, metadata loading, and every 15 s while playing.
-[au, vid].forEach((m) => {
-  m.addEventListener('seeked', () => { if (m === el()) syncSession(true); });
-  m.addEventListener('loadedmetadata', () => { if (m === el()) syncSession(true); });
-});
-setInterval(() => { if (curKind && !el().paused) syncSession(true); }, 15000);
 
 /* ---------------- music style ---------------- */
 const HINT = { disco: 'Disco: smooth on calm songs, hard cuts on strong beats.', flow: 'Flow: colors glide around the wheel and jump on every beat.' };
@@ -713,7 +659,6 @@ function closeSub(silent) {
   if (!silent && history.state && history.state.sub) history.back();
 }
 window.addEventListener('popstate', () => {
-  if (!$('vp').classList.contains('hide')) { closePlayer(true); return; }
   if (sub) { const s = sub; sub = null; closeSubFromBack(s); }
 });
 function closeSubFromBack(s) {

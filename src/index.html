@@ -90,6 +90,10 @@ input[type=range]{width:100%;accent-color:var(--red)}
 .empty{color:var(--faint);font-size:13px;text-align:center;padding:30px 10px;line-height:1.5}
 .seg.big{margin-bottom:14px}
 .seg.big button{display:flex;align-items:center;justify-content:center;gap:8px;padding:10px}
+.syncrow{display:flex;align-items:center;gap:12px;background:#0b0b0b;border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+.syncrow .sl1{font-size:13px;color:var(--muted);flex:none}
+.syncrow .sl2{font-size:13px;font-family:var(--disp);font-weight:700;width:58px;text-align:right;flex:none;font-variant-numeric:tabular-nums}
+.syncrow input{flex:1;min-width:0}
 .tools{display:flex;gap:10px;margin-bottom:12px}
 .search{flex:1;display:flex;align-items:center;gap:8px;background:#0b0b0b;border:1px solid var(--line);border-radius:12px;padding:0 12px;color:var(--faint)}
 .search input{flex:1;min-width:0;background:none;border:0;outline:0;color:var(--txt);font:inherit;font-size:14px;padding:11px 0}
@@ -111,29 +115,6 @@ input[type=range]{width:100%;accent-color:var(--red)}
 .nd{font-size:11px;color:var(--faint);margin-top:2px;font-variant-numeric:tabular-nums}
 .nb{width:38px;height:38px;border-radius:50%;border:0;background:none;color:var(--txt);display:flex;align-items:center;justify-content:center;flex:none}
 .nb.pp{background:var(--red);color:#fff}
-.vp{position:fixed;inset:0;z-index:45;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none;-webkit-user-select:none}
-.vp.hide{display:none}
-.vp video{width:100%;height:100%;object-fit:contain;background:#000}
-.vp.fill video{object-fit:cover}
-.vui{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;transition:opacity .22s;background:linear-gradient(180deg,#000c,transparent 24%,transparent 62%,#000e)}
-.vp.clean .vui{opacity:0;pointer-events:none}
-.vtop{display:flex;align-items:center;gap:6px;padding:12px max(14px,env(safe-area-inset-right,0px)) 0 max(10px,env(safe-area-inset-left,0px))}
-.vtitle{flex:1;min-width:0;font-family:var(--disp);font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#fff}
-.vb{width:46px;height:46px;border-radius:50%;border:0;background:none;color:#fff;display:flex;align-items:center;justify-content:center;flex:none;transition:background .15s}
-.vb:active{background:#ffffff22}
-.vpp{width:62px;height:62px;border:2px solid #fff}
-.vbot{padding:0 max(20px,env(safe-area-inset-right,0px)) max(12px,env(safe-area-inset-bottom,0px)) max(20px,env(safe-area-inset-left,0px))}
-.vseek{display:flex;align-items:center;gap:12px;font-size:12.5px;color:#fff;font-variant-numeric:tabular-nums;font-weight:500}
-.vseek span{min-width:44px;text-align:center}
-.vseek input{flex:1;height:22px;-webkit-appearance:none;appearance:none;background:transparent}
-.vseek input::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:linear-gradient(90deg,var(--red) var(--p,0%),#ffffff55 var(--p,0%))}
-.vseek input::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#fff;margin-top:-6px;box-shadow:0 1px 6px #0008}
-.vctl{display:flex;align-items:center;justify-content:space-between;margin-top:4px}
-.vside{width:46px;display:flex;justify-content:flex-end}
-.vmid{display:flex;align-items:center;gap:clamp(10px,4vw,34px)}
-.vflash{position:absolute;top:50%;transform:translateY(-50%);width:88px;height:88px;border-radius:50%;background:#0009;color:#fff;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .25s;pointer-events:none}
-.vflash.l{left:12%}.vflash.r{right:12%}
-.vflash.show{opacity:1}
 .mic{display:flex;justify-content:center;padding:6px 0}
 .ms{position:relative;width:210px;height:210px}.ms svg{position:absolute;inset:0}
 .mc{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
@@ -174,7 +155,6 @@ input[type=range]{width:100%;accent-color:var(--red)}
 .sbox button.dang{background:var(--red);border-color:var(--red);color:#fff}
 .toast{position:absolute;left:50%;bottom:120px;transform:translateX(-50%);background:#161616;border:1px solid var(--line2);font-size:12.5px;padding:10px 16px;border-radius:24px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;max-width:88%;text-align:center}
 .toast.show{opacity:1}
-.vp:not(.hide) ~ .toast{bottom:auto;top:calc(18px + env(safe-area-inset-top,0px))}
 @media (prefers-reduced-motion:reduce){.pane.on{animation:none}}
 </style>
 </head>
@@ -241,7 +221,13 @@ input[type=range]{width:100%;accent-color:var(--red)}
         <div class="mst">
           <div class="seg" id="styleSeg"><button class="sel" data-st="disco">Disco</button><button data-st="flow">Flow</button></div>
         </div>
-        <div class="hint" id="styleHint" style="margin:-4px 2px 14px"></div>
+        <div class="hint" id="styleHint" style="margin:-4px 2px 12px"></div>
+        <div class="syncrow" id="syncRow">
+          <span class="sl1">Light sync</span>
+          <input type="range" id="syR" min="0" max="500" step="10" aria-label="Light sync in milliseconds">
+          <span class="sl2" id="syN">150 ms</span>
+        </div>
+        <div class="hint" id="syncHint" style="margin:2px 2px 14px">With a Bluetooth speaker the sound arrives late. Raise this until the light and the beat land together.</div>
         <div class="tools">
           <label class="search"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><input id="q" type="search" placeholder="Search" autocomplete="off"></label>
           <label class="sort"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4"/></svg><select id="sortSel">
@@ -303,32 +289,6 @@ input[type=range]{width:100%;accent-color:var(--red)}
     <div class="st" id="shT"></div><div class="sd" id="shD"></div>
     <div id="shBtns"></div>
   </div></div>
-  <audio id="au" preload="auto"></audio>
-  <div class="vp hide" id="vp">
-    <video id="vid" playsinline preload="auto"></video>
-    <div class="vflash l" id="vFlashL"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"/><path d="M4 4v4h4"/><text x="12.3" y="15.2" text-anchor="middle" font-size="6.6" font-family="Space Grotesk,sans-serif" font-weight="700" fill="currentColor" stroke="none">10</text></svg></div>
-    <div class="vflash r" id="vFlashR"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M20 4v4h-4"/><text x="11.7" y="15.2" text-anchor="middle" font-size="6.6" font-family="Space Grotesk,sans-serif" font-weight="700" fill="currentColor" stroke="none">10</text></svg></div>
-    <div class="vui" id="vUi">
-      <div class="vtop">
-        <button class="vb" id="vClose" aria-label="Close"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 6l-6 6 6 6"/></svg></button>
-        <div class="vtitle" id="vTitle"></div>
-      </div>
-      <div class="vbot">
-        <div class="vseek"><span id="vCur">0:00</span><input type="range" id="vSeek" min="0" max="1000" value="0"><span id="vDur">-0:00</span></div>
-        <div class="vctl">
-          <span class="vside"></span>
-          <div class="vmid">
-            <button class="vb" id="vBack" aria-label="Back 10 seconds"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"/><path d="M4 4v4h4"/><text x="12.3" y="15.2" text-anchor="middle" font-size="6.6" font-family="Space Grotesk,sans-serif" font-weight="700" fill="currentColor" stroke="none">10</text></svg></button>
-            <button class="vb" id="vPrev" aria-label="Previous"><svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h2.2v14H6zM19 5.6v12.8L9.4 12z"/></svg></button>
-            <button class="vb vpp" id="vPlay" aria-label="Play"><svg id="vPlayI" width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></button>
-            <button class="vb" id="vNext" aria-label="Next"><svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M15.8 5H18v14h-2.2zM5 5.6v12.8L14.6 12z"/></svg></button>
-            <button class="vb" id="vFwd" aria-label="Forward 10 seconds"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M20 4v4h-4"/><text x="11.7" y="15.2" text-anchor="middle" font-size="6.6" font-family="Space Grotesk,sans-serif" font-weight="700" fill="currentColor" stroke="none">10</text></svg></button>
-          </div>
-          <span class="vside"><button class="vb" id="vFit" aria-label="Fill screen"><svg id="vFitI" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button></span>
-        </div>
-      </div>
-    </div>
-  </div>
   <div class="toast" id="toast"></div>
 </div>
 <script src="app.js"></script>
