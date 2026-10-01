@@ -21,14 +21,21 @@ import androidx.media3.common.MimeTypes;
 import androidx.media3.common.Player;
 import androidx.media3.common.TrackSelectionParameters;
 import androidx.media3.common.audio.AudioProcessor;
-import androidx.media3.exoplayer.DefaultRenderersFactory;
+import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.Renderer;
+import androidx.media3.exoplayer.RenderersFactory;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
+import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer;
 import androidx.media3.exoplayer.audio.TeeAudioProcessor;
+import androidx.media3.exoplayer.drm.DrmSessionManager;
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.exoplayer.source.BundledExtractorsAdapter;
+import androidx.media3.exoplayer.source.ProgressiveMediaSource;
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy;
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
 import androidx.media3.extractor.DefaultExtractorsFactory;
 import androidx.media3.session.DefaultMediaNotificationProvider;
 import androidx.media3.session.MediaSession;
@@ -175,53 +182,54 @@ public class PlaybackService extends MediaSessionService {
 
     // ---------------------------------------------------------------- player
 
-    /** Hands the audio to the tap on its way to the speaker. */
-    private final class TapRenderers extends DefaultRenderersFactory {
-        TapRenderers(Context context) {
-            super(context);
-        }
+    /** The speaker's audio sink, with the tap that feeds the lights placed right before it. */
+    private AudioSink buildAudioSink() {
+        TeeAudioProcessor.AudioBufferSink sink = new TeeAudioProcessor.AudioBufferSink() {
+            @Override
+            public void flush(int sampleRateHz, int channelCount, int encoding) {
+                tap.configure(sampleRateHz, channelCount, encoding);
+            }
 
-        @Override
-        protected AudioSink buildAudioSink(Context context, boolean enableFloatOutput, boolean enableAudioTrackPlaybackParams) {
-            TeeAudioProcessor.AudioBufferSink sink = new TeeAudioProcessor.AudioBufferSink() {
-                @Override
-                public void flush(int sampleRateHz, int channelCount, int encoding) {
-                    tap.configure(sampleRateHz, channelCount, encoding);
-                }
-
-                @Override
-                public void handleBuffer(ByteBuffer buffer) {
-                    tap.write(buffer);
-                }
-            };
-            return new DefaultAudioSink.Builder(context)
-                    .setEnableFloatOutput(enableFloatOutput)
-                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    .setAudioProcessors(new AudioProcessor[] {new TeeAudioProcessor(sink)})
-                    .build();
-        }
+            @Override
+            public void handleBuffer(ByteBuffer buffer) {
+                tap.write(buffer);
+            }
+        };
+        return new DefaultAudioSink.Builder(this)
+                .setEnableFloatOutput(true)                   // 24 and 32 bit files keep their depth
+                .setEnableAudioTrackPlaybackParams(false)
+                .setAudioProcessors(new AudioProcessor[] {new TeeAudioProcessor(sink)})
+                .build();
     }
 
     private ExoPlayer buildPlayer() {
         // Phone chip decoders first; if one fails the next one is tried automatically.
-        MediaCodecSelector selector = (mimeType, requiresSecure, requiresTunneling) -> {
+        final MediaCodecSelector selector = (mimeType, requiresSecure, requiresTunneling) -> {
             List<MediaCodecInfo> infos = MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, requiresSecure, requiresTunneling);
             if (!MimeTypes.isVideo(mimeType)) return infos;
             List<MediaCodecInfo> sorted = new ArrayList<>(infos);
             Collections.sort(sorted, (a, b) -> Integer.compare(a.hardwareAccelerated ? 0 : 1, b.hardwareAccelerated ? 0 : 1));
             return sorted;
         };
-        DefaultRenderersFactory renderers = new TapRenderers(this)
-                .setMediaCodecSelector(selector)
-                .setEnableDecoderFallback(true)
-                .setEnableAudioFloatOutput(true);   // 24 and 32 bit files keep their depth
-        DefaultExtractorsFactory extractors = new DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true);
+        // Only the two renderers a video / music player needs (picture and sound). The subtitle,
+        // metadata, image and camera ones are never used here, so they are not even packaged.
+        RenderersFactory renderers = (handler, videoListener, audioListener, textOutput, metadataOutput) -> new Renderer[] {
+                new MediaCodecVideoRenderer(this, selector, 5000L, true, handler, videoListener, 50),
+                new MediaCodecAudioRenderer(this, selector, true, handler, audioListener, buildAudioSink())
+        };
+        // Local files only: read them directly, with no streaming, ads, subtitle or DRM machinery.
+        final DefaultExtractorsFactory extractors = new DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true);
+        ProgressiveMediaSource.Factory source = new ProgressiveMediaSource.Factory(
+                new DefaultDataSource.Factory(this),
+                playerId -> new BundledExtractorsAdapter(extractors),
+                mediaItem -> DrmSessionManager.DRM_UNSUPPORTED,
+                new DefaultLoadErrorHandlingPolicy(),
+                1024 * 1024);
         AudioAttributes attrs = new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                 .build();
-        ExoPlayer p = new ExoPlayer.Builder(this, renderers)
-                .setMediaSourceFactory(new DefaultMediaSourceFactory(this, extractors))
+        ExoPlayer p = new ExoPlayer.Builder(this, renderers, source)
                 .setAudioAttributes(attrs, true)
                 .setHandleAudioBecomingNoisy(true)
                 .setWakeMode(C.WAKE_MODE_LOCAL)

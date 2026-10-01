@@ -8,7 +8,7 @@ android {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode ((System.getenv("GITHUB_RUN_NUMBER") ?: "1") as Integer)
-        versionName "1.8.0"
+        versionName "1.8.1"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -22,6 +22,16 @@ android {
             storePassword 'digitalminds'
             keyAlias 'universe'
             keyPassword 'digitalminds'
+        }
+    }
+    // The app is in English: do not pack the translations that AndroidX and Media3 ship for ~80 languages.
+    androidResources {
+        localeFilters.addAll(["en"])
+    }
+    // Files that only matter when compiling Kotlin / Java libraries, never when the app runs.
+    packaging {
+        resources {
+            excludes += ["META-INF/*.kotlin_module", "META-INF/versions/**", "**/*.kotlin_builtins", "**/*.kotlin_metadata", "DebugProbesKt.bin", "kotlin-tooling-metadata.json"]
         }
     }
     lint {
