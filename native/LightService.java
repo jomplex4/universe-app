@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
+import android.media.AudioAttributes;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -59,6 +60,9 @@ public class LightService extends Service {
             @Override public void onSkipToPrevious() { send("prev"); }
             @Override public void onSeekTo(long pos) { send("seek:" + pos); }
         });
+        // Local playback on the normal media stream: the volume keys and the output switcher in the notification act on it.
+        session.setPlaybackToLocal(new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build());
         try { art = BitmapFactory.decodeResource(getResources(), R.drawable.media_art); } catch (Exception ignored) { }
     }
 

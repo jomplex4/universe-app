@@ -201,7 +201,10 @@ const SCENES = [
 let actx = null, analyser = null, buf = null, tbuf = null, mediaSrc = null, micStream = null, micSrc = null;
 function audioCtx() {
   if (!actx) {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
+    // The analyser only LISTENS: songs and videos play through Android's normal media output, so this
+    // context asks for no speaker of its own ({type:'none'}). Engines that do not know it use the default.
+    try { actx = new (window.AudioContext || window.webkitAudioContext)({ sinkId: { type: 'none' } }); }
+    catch (e) { actx = new (window.AudioContext || window.webkitAudioContext)(); }
     analyser = actx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.35;
     analyser.minDecibels = -90; analyser.maxDecibels = -10;   // wide range: loud music never saturates
     buf = new Uint8Array(analyser.frequencyBinCount); tbuf = new Float32Array(analyser.fftSize);
@@ -286,15 +289,21 @@ function reactiveGen(kind) {
   };
 }
 
+let voiceReq = 0;
 async function startVoice() {
+  const req = ++voiceReq;
   try {
     audioCtx(); [au, vid].forEach((m) => { if (!m.paused) m.pause(); });
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
+    const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
+    // You left Voice while Android was still asking for permission: do not keep the microphone open.
+    if (req !== voiceReq || sub !== 'voice') { ms.getTracks().forEach((x) => x.stop()); return; }
+    micStream = ms;
     micSrc = actx.createMediaStreamSource(micStream); micSrc.connect(analyser);
     setMode('voice', reactiveGen('voice'), 0.35); clearSel(); $('rcVoice').classList.add('sel');
   } catch (e) { toast('Allow microphone access to use Voice'); }
 }
 function stopMic() {
+  voiceReq++;                                            // cancels a microphone request that is still waiting
   if (micSrc) { try { micSrc.disconnect(); } catch (e) {} micSrc = null; }
   if (micStream) { micStream.getTracks().forEach((x) => x.stop()); micStream = null; }
 }
@@ -309,9 +318,49 @@ const el = () => (curKind === 'video' ? vid : au);
 // Capacitor serves the whole file and Android's web engine applies the byte range itself.
 const mediaUrl = (path) => (NATIVE ? Capacitor.convertFileSrc(path) : path);
 
+/* Old way (kept only as a safety net): the element's whole sound is rerouted through Web Audio.
+   That makes the app open an audio channel of its own, outside Android's normal media output. */
 function wireMedia(m) {
   audioCtx();
+  if (actx.setSinkId) { try { actx.setSinkId('').catch(() => {}); } catch (e) {} }   // this way it needs a real speaker
   if (!srcNode.has(m)) { const n = actx.createMediaElementSource(m); n.connect(actx.destination); n.connect(analyser); srcNode.set(m, n); }
+}
+/* New way: the song or video keeps playing through Android's normal media output (system volume keys,
+   Bluetooth, the output switcher in the notification all work as in any player). Its sound is only COPIED
+   into the analyser. If the web engine cannot copy it, we fall back to the old way. */
+let tapMode = 'copy', tapNode = null, tapEl = null, tapKey = '', tapTrack = null, tapTries = 0, tapRetryT = null, tapWatchT = null;
+function dropTap() { if (tapNode) { try { tapNode.disconnect(); } catch (e) {} } tapNode = null; tapEl = null; tapKey = ''; tapTrack = null; clearTimeout(tapRetryT); clearTimeout(tapWatchT); }
+function fallbackRoute(m) { tapMode = 'route'; dropTap(); if (m && m === el()) wireMedia(m); }
+function tapMedia(m) {
+  if (m !== el()) return;
+  if (tapMode === 'route') { wireMedia(m); return; }
+  const key = m.currentSrc || m.src;
+  if (tapNode && tapEl === m && tapKey === key && tapTrack && tapTrack.readyState === 'live') return;   // already listening to this file
+  dropTap(); audioCtx();
+  let st = null;
+  try { st = typeof m.captureStream === 'function' ? m.captureStream() : null; } catch (e) { st = null; }
+  const at = st ? st.getAudioTracks() : [];
+  if (!at.length) {                                    // the tracks can appear a moment after playback starts
+    if (!st || ++tapTries > 12) { tapTries = 0; fallbackRoute(m); return; }
+    tapRetryT = setTimeout(() => tapMedia(m), 200); return;
+  }
+  tapTries = 0;
+  st.getVideoTracks().forEach((v) => { try { v.stop(); } catch (e) {} });          // sound only, no picture copies
+  tapTrack = at[0]; tapEl = m; tapKey = key;
+  tapNode = actx.createMediaStreamSource(new MediaStream([tapTrack])); tapNode.connect(analyser);
+  watchTap(m, 0);
+}
+// If the copy turns out to be pure silence for the first 6 s of real playback, use the old way instead.
+function watchTap(m, n) {
+  clearTimeout(tapWatchT);
+  tapWatchT = setTimeout(() => {
+    if (m !== el() || tapEl !== m || !analyser) return;
+    if (m.paused) { watchTap(m, n); return; }
+    analyser.getByteFrequencyData(buf); let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i];
+    if (sum > 0) return;                                // it hears the sound: all good
+    if (n >= 5 && m.currentTime > 4) { fallbackRoute(m); return; }
+    watchTap(m, n + 1);
+  }, 1200);
 }
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(err('TIMEOUT')), ms))]);
 const loading = { audio: false, video: false };
@@ -404,7 +453,8 @@ function playAt(i, kind) {
   if (!other.paused) other.pause();
   if (curKind && curKind !== kind) other.removeAttribute('src');
   curKind = kind; stopMic();
-  const m = el(); wireMedia(m);
+  const m = el(); audioCtx(); if (tapMode === 'route') wireMedia(m);
+  if (kind === 'video') $('vFrame').classList.remove('ready');      // black until the first picture is ready
   m.src = mediaUrl(x.path);
   m.play().catch(() => toast('This file could not be played'));
   mode = 'music'; gen = reactiveGen('music'); ease = 0.45; clearSel(); $('rcMusic').classList.add('sel');
@@ -430,6 +480,7 @@ function stepTrack(d) {
     if (m === vid && !seeking) { $('vSeek').value = Math.round(pct * 10); paintSeek(pct); $('vCur').textContent = clockP(m.currentTime * 1000); $('vDur').textContent = '-' + clockP((m.duration - m.currentTime) * 1000); }
   });
   m.addEventListener('loadedmetadata', () => { if (m === el()) $('mSeek').disabled = false; });
+  m.addEventListener('playing', () => { if (m === el()) tapMedia(m); });
   m.addEventListener('play', () => { if (m === el()) paintPlay(true); });
   m.addEventListener('pause', () => { if (m === el()) paintPlay(false); });
   m.addEventListener('ended', () => { if (m === el()) playAt(qi + 1); });
@@ -471,6 +522,8 @@ function onVideoSize() {
   if (Math.abs(r - vRatio) > 0.001) { vRatio = r; resetPicture(); } else layoutFrame();
 }
 vid.addEventListener('loadedmetadata', onVideoSize);
+vid.addEventListener('loadeddata', () => $('vFrame').classList.add('ready'));
+vid.addEventListener('playing', () => $('vFrame').classList.add('ready'));
 vid.addEventListener('resize', onVideoSize);
 window.addEventListener('resize', () => { if (!$('vp').classList.contains('hide')) resetPicture(); });   // turning the phone: back to Fit
 
