@@ -13,12 +13,11 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 const NATIVE = Capacitor.isNativePlatform();
 const MusicLibrary = registerPlugin('MusicLibrary');
 const Strip = registerPlugin('Strip');   // our own native Bluetooth (APK)
-const Player = registerPlugin('Player');  // native player: ExoPlayer, same engine as COMET (APK)
 const $ = (id) => document.getElementById(id);
 
 /* ---------------- state ---------------- */
 const S = Object.assign(
-  { r: 225, g: 6, b: 0, bright: 100, speed: 50, sens: 70, power: true, lastId: null, mstyle: 'disco', sync: 150 },
+  { r: 225, g: 6, b: 0, bright: 100, speed: 50, sens: 70, power: true, lastId: null, mstyle: 'disco' },
   load('u_state') || {}
 );
 function save() { localStorage.setItem('u_state', JSON.stringify(S)); }
@@ -210,17 +209,16 @@ function audioCtx() {
   if (actx.state === 'suspended') actx.resume();
   return actx;
 }
+const band = (a, b) => { let s = 0; for (let i = a; i < b; i++) s += buf[i]; return s / (b - a) / 255; };
 
 const CLUB = [[255,0,0],[0,70,255],[255,0,200],[0,255,200],[255,140,0],[140,0,255],[0,255,40],[255,0,70]];
 function reactiveGen(kind) {
   let hue = rgbHsv(S.r, S.g, S.b)[0], avgBass = 0.1, avgMid = 0.1, avgHigh = 0.1, lastBeat = 0, lvl = 0, kick = 0;
-  let hard = 0, punch = 1, ci = 0, avgFlux = 0.01; const beats = []; let prev = new Uint8Array(256);
+  let hard = 0, punch = 1, ci = 0, avgFlux = 0.01; const beats = []; const prev = new Uint8Array(buf ? buf.length : 256);
   let last = [255, 0, 0];
-  const nat = NATIVE && kind === 'music';          // songs and karaoke: the player's own audio, not the microphone
   return (t) => {
-    let B, sr;
-    if (nat) { B = nativeSpectrum(); if (!B) return last; sr = specRate; }
-    else { if (!analyser) return hsvRgb(hue, 1, 1); analyser.getByteFrequencyData(buf); B = buf; sr = actx.sampleRate; }
+    if (!analyser) return hsvRgb(hue, 1, 1);
+    analyser.getByteFrequencyData(buf);
     const s = 0.4 + (S.sens / 100) * 1.6;
     if (kind === 'voice') {
       // Loudness in real decibels (independent of the analyser's display range).
@@ -233,18 +231,16 @@ function reactiveGen(kind) {
       return wheelAt(3 / 7 + lvl * (4 / 7)); // quiet = blue, loud = red
     }
     // Real frequency bands from the sample rate: 60-250 Hz, 250-2000 Hz, 2000-10000 Hz
-    const hz = (f) => clamp(Math.round((f / (sr / 2)) * B.length), 1, B.length - 1);
-    const band = (a, b) => { let sum = 0; for (let i = a; i < b; i++) sum += B[i]; return sum / (b - a) / 255; };
-    if (prev.length !== B.length) prev = new Uint8Array(B.length);
+    const hz = (f) => clamp(Math.round((f / (actx.sampleRate / 2)) * buf.length), 1, buf.length - 1);
     const bass = band(hz(60), hz(250) + 1), mid = band(hz(250), hz(2000)), high = band(hz(2000), hz(10000));
     const energy = (bass + mid + high) / 3;
     avgBass += (bass - avgBass) * 0.03; avgMid += (mid - avgMid) * 0.03; avgHigh += (high - avgHigh) * 0.03;
     const loud = clamp(energy * s * 2.4, 0, 1);
     // Beat = sudden NEW energy in the low end (spectral flux), robust with any mix or volume.
     let flux = 0; const b0 = hz(40), b1 = hz(160) + 1;
-    for (let i = b0; i < b1; i++) { const d = B[i] - prev[i]; if (d > 0) flux += d; }
+    for (let i = b0; i < b1; i++) { const d = buf[i] - prev[i]; if (d > 0) flux += d; }
     flux /= (b1 - b0) * 255;
-    prev.set(B);
+    prev.set(buf);
     avgFlux += (flux - avgFlux) * 0.05;
     const beat = flux > avgFlux * 2 + 0.02 && t - lastBeat > 0.2;
     if (beat) lastBeat = t;
@@ -292,7 +288,7 @@ function reactiveGen(kind) {
 
 async function startVoice() {
   try {
-    audioCtx(); if (NATIVE && MS.playing) Player.toggle().catch(() => {});
+    audioCtx(); [au, vid].forEach((m) => { if (!m.paused) m.pause(); });
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
     micSrc = actx.createMediaStreamSource(micStream); micSrc.connect(analyser);
     setMode('voice', reactiveGen('voice'), 0.35); clearSel(); $('rcVoice').classList.add('sel');
@@ -304,10 +300,19 @@ function stopMic() {
 }
 
 /* ---------------- media library + player (songs and videos) ---------------- */
+const au = $('au'), vid = $('vid');
 const LIBS = { audio: null, video: null };
+const srcNode = new Map();                  // one Web Audio source per element
 let view = 'folders', openFolder = null, queueItems = [], qi = -1, curKind = null, query = '';
 S.lib = S.lib || 'audio'; S.sort = S.sort || 'az';
-if (typeof S.sync !== 'number') S.sync = 150;
+const el = () => (curKind === 'video' ? vid : au);
+// Capacitor serves the whole file and Android's web engine applies the byte range itself.
+const mediaUrl = (path) => (NATIVE ? Capacitor.convertFileSrc(path) : path);
+
+function wireMedia(m) {
+  audioCtx();
+  if (!srcNode.has(m)) { const n = actx.createMediaElementSource(m); n.connect(actx.destination); n.connect(analyser); srcNode.set(m, n); }
+}
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(err('TIMEOUT')), ms))]);
 const loading = { audio: false, video: false };
 async function loadLibrary() {
@@ -316,7 +321,6 @@ async function loadLibrary() {
     $('libSeg').hidden = true; $('musicSeg').hidden = true; $('mlist').innerHTML = '';
     document.querySelector('.tools').hidden = true;
     $('musicSub').textContent = 'Music and karaoke play in the Android app. Here, the strip follows the sound around you.';
-    $('syncRow').hidden = true; $('syncHint').hidden = true;
     startMicMusic(); return;
   }
   if (LIBS[kind]) { renderList(); return; }
@@ -391,68 +395,147 @@ function renderList() {
   box.querySelectorAll('[data-s]').forEach((b) => (b.onclick = () => { queueItems = items; playAt(+b.dataset.s, S.lib); }));
 }
 
-/* ---- native player (ExoPlayer in the APK): songs and karaoke videos ---- */
-let MS = { playing: false, path: '', title: '', artist: '', position: 0, duration: 0, kind: null, count: 0 };   // last state the player reported
-
-function paintMini(m) {
-  $('mini').classList.remove('hide');
-  $('nowT').textContent = m.title || '';
-  $('mArt').innerHTML = m.kind === 'video' ? IC_VIDEO : IC_NOTE;
-  const dur = m.duration || 0, pos = m.position || 0;
-  $('progI').style.width = (dur ? Math.min(100, (pos / dur) * 100) : 0) + '%';
-  $('nowD').textContent = dur ? fmt(pos) + ' / ' + fmt(dur) : (m.kind === 'video' ? 'Karaoke' : '');
-  $('ppI').innerHTML = m.playing ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M7 5v14l12-7z"/>';
-}
-function onPlayerState(m) {
-  if (!m || !m.count) { MS = { playing: false, count: 0 }; curKind = null; $('mini').classList.add('hide'); syncSession(); return; }
-  MS = m; curKind = m.kind;
-  if (m.index !== qi && m.index >= 0 && m.index < queueItems.length) { qi = m.index; if (sub === 'music') renderList(); }   // next song, headset buttons...
-  paintMini(m);
-}
 function playAt(i, kind) {
-  if (!NATIVE || !queueItems.length) return;
+  if (!queueItems.length) return;
   kind = kind || curKind || 'audio';
   qi = (i + queueItems.length) % queueItems.length;
   const x = queueItems[qi];
+  const other = kind === 'video' ? au : vid;
+  if (!other.paused) other.pause();
+  if (curKind && curKind !== kind) other.removeAttribute('src');
   curKind = kind; stopMic();
-  Player.play({ kind, index: qi, items: queueItems.map((q) => ({ uri: q.uri, path: q.path, title: q.title, artist: q.artist })) })
-    .catch(() => toast('This file could not be played'));
+  const m = el(); wireMedia(m);
+  m.src = mediaUrl(x.path);
+  m.play().catch(() => toast('This file could not be played'));
   mode = 'music'; gen = reactiveGen('music'); ease = 0.45; clearSel(); $('rcMusic').classList.add('sel');
-  paintMini({ title: x.title, kind, playing: true, position: 0, duration: x.duration });
+  $('nowT').textContent = x.title; $('vTitle').textContent = x.title;
+  $('mSeek').value = 0; paintMini(0); $('mSeek').disabled = true;
+  $('mArt').innerHTML = kind === 'video' ? IC_VIDEO : IC_NOTE;
+  $('mini').classList.remove('hide');
+  if (kind === 'video') openPlayer();
   if (sub === 'music') renderList();
+  syncSession();
 }
-if (NATIVE) {
-  Player.addListener('state', onPlayerState);
-  Player.addListener('error', () => toast('This file could not be played'));
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) Player.getState().then(onPlayerState).catch(() => {}); });
+function togglePlay() { if (!curKind) return; const m = el(); if (m.paused) { audioCtx(); m.play(); } else m.pause(); }
+function stepTrack(d) {
+  if (!curKind) return;
+  const m = el();
+  if (d < 0 && m.currentTime > 3) { m.currentTime = 0; return; }
+  playAt(qi + d);
 }
-$('ppB').onclick = () => { if (!NATIVE || !curKind) return; if (curKind === 'video' && !MS.playing) Player.openVideo(); Player.toggle(); };
-$('nextB').onclick = () => { if (NATIVE && curKind) Player.next(); };
-$('prevB').onclick = () => { if (NATIVE && curKind) Player.prev(); };
-$('mOpen').onclick = () => { if (curKind === 'video') Player.openVideo(); else { showTab('p-scenes'); openSub('music'); } };
-
-/* ---- what the lights hear: the audio the player is about to play, 20 times per second ---- */
-const specQ = []; let specRate = 44100, specCur = null;
-if (NATIVE) Player.addListener('spectrum', (e) => {
-  const raw = atob(e.d), a = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) a[i] = raw.charCodeAt(i);
-  specQ.push({ t: performance.now(), a }); specRate = e.sr;
-  if (specQ.length > 40) specQ.shift();
+[au, vid].forEach((m) => {
+  m.addEventListener('timeupdate', () => { if (m !== el() || !m.duration) return;
+    const pct = (m.currentTime / m.duration) * 100;
+    if (!miniSeeking) { $('mSeek').value = Math.round(pct * 10); paintMini(pct); $('nowD').textContent = fmt(m.currentTime * 1000) + ' / ' + fmt(m.duration * 1000); }
+    if (m === vid && !seeking) { $('vSeek').value = Math.round(pct * 10); paintSeek(pct); $('vCur').textContent = clockP(m.currentTime * 1000); $('vDur').textContent = '-' + clockP((m.duration - m.currentTime) * 1000); }
+  });
+  m.addEventListener('loadedmetadata', () => { if (m === el()) $('mSeek').disabled = false; });
+  m.addEventListener('play', () => { if (m === el()) paintPlay(true); });
+  m.addEventListener('pause', () => { if (m === el()) paintPlay(false); });
+  m.addEventListener('ended', () => { if (m === el()) playAt(qi + 1); });
 });
-// The newest frame that is at least S.sync ms old. A Bluetooth speaker plays later than the phone
-// thinks, so delaying the light by that much puts color and sound back together.
-function nativeSpectrum() {
-  const due = performance.now() - S.sync;
-  let f = null;
-  while (specQ.length && specQ[0].t <= due) f = specQ.shift();
-  if (f) specCur = f;
-  if (specCur && performance.now() - specCur.t > 700 + S.sync) specCur = null;   // paused or stopped: let go
-  return specCur ? specCur.a : null;
+function paintPlay(on) {
+  const I = on ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M7 5v14l12-7z"/>';
+  $('ppI').innerHTML = I; $('vPlayI').innerHTML = PI(on ? 'pause' : 'play', 20);
+  if (on) scheduleHide(); else showCtrl();
+  syncSession();
 }
+$('ppB').onclick = () => { if (curKind === 'video' && el().paused) openPlayer(); togglePlay(); };   // a paused video comes back on screen
+$('nextB').onclick = () => stepTrack(1);
+$('prevB').onclick = () => stepTrack(-1);
+$('mOpen').onclick = () => { if (curKind === 'video') openPlayer(); else { showTab('p-scenes'); openSub('music'); } };
 
-/* ---- light sync ---- */
-$('syR').value = S.sync; $('syN').textContent = S.sync + ' ms';
-$('syR').addEventListener('input', () => { S.sync = +$('syR').value; $('syN').textContent = S.sync + ' ms'; save(); });
+/* ---- karaoke player: same look and behavior as the COMET player ---- */
+const ICONS = {"ic_back": "<path d=\"M19,12H5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M11,6l-6,6 6,6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>", "ic_replay10": "<path d=\"M12,5A8,8 0 1,1 4,13\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M12,5l2.8,-2.4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M12,5l2.8,2.4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M9.8,11.2v4.8\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M13.8,11a1.5,2.5 0 0,1 0,5a1.5,2.5 0 0,1 0,-5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>", "ic_forward10": "<path d=\"M12,5A8,8 0 1,0 20,13\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M12,5l-2.8,-2.4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M12,5l-2.8,2.4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M9.8,11.2v4.8\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M13.8,11a1.5,2.5 0 0,1 0,5a1.5,2.5 0 0,1 0,-5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>", "ic_prev": "<path d=\"M7,5v14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M18,5.6a1,1 0,0 0,-1.53 -0.85l-9.5,6.4a1,1 0,0 0,0 1.7l9.5,6.4a1,1 0,0 0,1.53 -0.85z\" fill=\"currentColor\"/>", "ic_next": "<path d=\"M17,5v14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M6,5.6a1,1 0,0 1,1.53 -0.85l9.5,6.4a1,1 0,0 1,0 1.7l-9.5,6.4a1,1 0,0 1,-1.53 -0.85z\" fill=\"currentColor\"/>", "ic_play": "<path d=\"M7,4.6a1,1 0,0 1,1.53 -0.85l11,7.4a1,1 0,0 1,0 1.7l-11,7.4a1,1 0,0 1,-1.53 -0.85z\" fill=\"currentColor\"/>", "ic_pause": "<path d=\"M6,4h4v16h-4z\" fill=\"currentColor\"/><path d=\"M14,4h4v16h-4z\" fill=\"currentColor\"/>", "ic_fit": "<path d=\"M3,5h18v14H3z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M8,9h8v6H8z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>", "ic_fill": "<path d=\"M4,9V5h4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M16,5h4v4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M20,15v4h-4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M8,19H4v-4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"};
+function PI(name, size) { return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24">' + ICONS['ic_' + name] + '</svg>'; }
+let seeking = false, miniSeeking = false, hideT = null, hudT = null, tapT = null, lastTap = 0;
+let fillMode = false, fillK = 1, vRatio = 0;
+const clockP = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), q = s % 60, p2 = (n) => String(n).padStart(2, '0'); return h ? h + ':' + p2(m) + ':' + p2(q) : p2(m) + ':' + p2(q); };
+function paintSeek(pct) { $('vSeek').style.setProperty('--p', pct + '%'); }
+function paintMini(pct) { $('mSeek').style.setProperty('--p', pct + '%'); }
+
+// Fit = the whole picture inside the screen. Fill = the same frame scaled up until it covers everything.
+function layoutFrame() {
+  const W = window.innerWidth, H = window.innerHeight; let fw = W, fh = H;
+  if (vRatio > 0) { if (vRatio > W / H) fh = Math.round(W / vRatio); else fw = Math.round(H * vRatio); }
+  const f = $('vFrame'); f.style.width = fw + 'px'; f.style.height = fh + 'px';
+  fillK = Math.max(1, W / fw, H / fh);
+  f.style.setProperty('--ps', fillMode ? fillK : 1);
+  $('vFitI').innerHTML = PI(fillMode ? 'fit' : 'fill', 24);
+}
+function resetPicture() { fillMode = false; layoutFrame(); }
+function togglePicture() { fillMode = !(fillMode || fillK <= 1.02); layoutFrame(); showHud(fillMode ? 'Fill' : 'Fit'); }
+function onVideoSize() {
+  if (!vid.videoWidth || !vid.videoHeight) return;
+  const r = vid.videoWidth / vid.videoHeight;
+  if (Math.abs(r - vRatio) > 0.001) { vRatio = r; resetPicture(); } else layoutFrame();
+}
+vid.addEventListener('loadedmetadata', onVideoSize);
+vid.addEventListener('resize', onVideoSize);
+window.addEventListener('resize', () => { if (!$('vp').classList.contains('hide')) resetPicture(); });   // turning the phone: back to Fit
+
+function showHud(text) { const h = $('vHud'); h.textContent = text; h.style.display = 'block'; clearTimeout(hudT); hudT = setTimeout(() => { h.style.display = 'none'; }, 900); }
+function hideCtrl() { if (seeking) return; $('vCtrl').classList.add('off'); }
+function scheduleHide() { clearTimeout(hideT); if (!vid.paused && !seeking) hideT = setTimeout(hideCtrl, 3500); }
+function showCtrl() { $('vCtrl').classList.remove('off'); scheduleHide(); }
+
+function openPlayer() {
+  if (!$('vp').classList.contains('hide')) return;
+  $('vp').classList.remove('hide'); layoutFrame(); showCtrl();
+  history.pushState({ player: 1 }, '');
+  if (NATIVE) Strip.immersive({ on: true, landscape: true }).catch(() => {});   // karaoke is widescreen, edge to edge
+}
+// The back arrow stops watching: the video pauses and the queue stays (the mini player brings it back).
+function closePlayer(fromBack) {
+  if ($('vp').classList.contains('hide')) return;
+  if (!vid.paused) vid.pause();
+  clearTimeout(hideT); clearTimeout(tapT); tapT = null;
+  $('vp').classList.add('hide');
+  if (NATIVE) Strip.immersive({ on: false }).catch(() => {});
+  if (!fromBack && history.state && history.state.player) history.back();
+}
+function skip(sec) {
+  if (!vid.duration) return;
+  vid.currentTime = clamp(vid.currentTime + sec, 0, Math.max(0, vid.duration - 0.2));
+  showHud(sec < 0 ? '-10s' : '+10s');
+}
+// Tap = show or hide the controls. Double tap: left side -10 s, right side +10 s, middle play / pause.
+$('vGest').addEventListener('click', (e) => {
+  const now = performance.now();
+  if (tapT && now - lastTap < 300) {
+    clearTimeout(tapT); tapT = null; lastTap = 0;
+    const w = window.innerWidth;
+    if (e.clientX < w * 0.35) skip(-10); else if (e.clientX > w * 0.65) skip(10);
+    else { togglePlay(); showHud(vid.paused ? 'Pause' : 'Play'); }
+    return;
+  }
+  lastTap = now;
+  tapT = setTimeout(() => { tapT = null; if ($('vCtrl').classList.contains('off')) showCtrl(); else hideCtrl(); }, 300);
+});
+$('vClose').onclick = () => closePlayer(false);
+$('vPlay').onclick = () => { togglePlay(); scheduleHide(); };
+$('vPrev').onclick = () => { stepTrack(-1); scheduleHide(); };
+$('vNext').onclick = () => { stepTrack(1); scheduleHide(); };
+$('vBack').onclick = () => { skip(-10); scheduleHide(); };
+$('vFwd').onclick = () => { skip(10); scheduleHide(); };
+$('vFit').onclick = () => { togglePicture(); scheduleHide(); };
+$('vSeek').addEventListener('input', () => {
+  seeking = true; clearTimeout(hideT); paintSeek($('vSeek').value / 10);
+  if (vid.duration) { const p = ($('vSeek').value / 1000) * vid.duration * 1000; $('vCur').textContent = clockP(p); $('vDur').textContent = '-' + clockP(vid.duration * 1000 - p); }
+});
+$('vSeek').addEventListener('change', () => { if (vid.duration) vid.currentTime = ($('vSeek').value / 1000) * vid.duration; seeking = false; scheduleHide(); });
+
+/* ---- the seek line in the mini player (songs and videos) ---- */
+$('mSeek').addEventListener('input', () => {
+  miniSeeking = true; paintMini($('mSeek').value / 10);
+  const m = curKind ? el() : null;
+  if (m && m.duration) $('nowD').textContent = fmt(($('mSeek').value / 1000) * m.duration * 1000) + ' / ' + fmt(m.duration * 1000);
+});
+$('mSeek').addEventListener('change', () => {
+  const m = curKind ? el() : null;
+  if (m && m.duration) m.currentTime = ($('mSeek').value / 1000) * m.duration;
+  miniSeeking = false;
+});
 
 /* ---- library controls ---- */
 document.querySelectorAll('#libSeg button').forEach((b) => (b.onclick = () => {
@@ -469,17 +552,32 @@ $('sortSel').onchange = () => { S.sort = $('sortSel').value; save(); if (LIBS[S.
 $('q').addEventListener('input', () => { query = $('q').value; if (LIBS[S.lib]) renderList(); });
 document.querySelectorAll('#libSeg button').forEach((x) => x.classList.toggle('sel', x.dataset.k === S.lib));
 
-/* ---- background notification (light) ---- */
+/* ---- notification, lock screen and headset controls ---- */
 let lastSession = '';
-function syncSession() {
+function syncSession(force) {
   if (!NATIVE) return;
-  const st = { on: BLE.connected, light: S.power && S.bright > 0 };
-  const key = JSON.stringify(st); if (key === lastSession) return; lastSession = key;
+  const x = queueItems[qi];
+  const m = curKind ? el() : null;
+  const st = { on: BLE.connected || !!curKind, bt: BLE.connected, media: !!curKind, playing: !!m && !m.paused,
+    light: S.power && S.bright > 0, title: x ? x.title : '', artist: x ? (x.artist || (curKind === 'video' ? 'Karaoke' : '')) : '',
+    duration: m && isFinite(m.duration) ? Math.round(m.duration * 1000) : 0 };
+  const key = JSON.stringify(st); if (key === lastSession && !force) return; lastSession = key;
+  st.position = m ? Math.round(m.currentTime * 1000) : 0;          // lets the system seek bar move on its own
   Strip.session(st).catch(() => {});
 }
 if (NATIVE) Strip.addListener('media', ({ action }) => {
-  if (action === 'power') { if (S.bright === 0) setNum('bright', 60); S.power = !S.power; save(); paintPower(); }
+  if (action === 'toggle') togglePlay();
+  else if (action === 'next') stepTrack(1);
+  else if (action === 'prev') stepTrack(-1);
+  else if (action === 'power') { if (S.bright === 0) setNum('bright', 60); S.power = !S.power; save(); paintPower(); }
+  else if (action.startsWith('seek:') && curKind) { el().currentTime = (+action.slice(5) || 0) / 1000; }
 });
+// Keep the system seek bar in step after seeking, metadata loading, and every 15 s while playing.
+[au, vid].forEach((m) => {
+  m.addEventListener('seeked', () => { if (m === el()) syncSession(true); });
+  m.addEventListener('loadedmetadata', () => { if (m === el()) syncSession(true); });
+});
+setInterval(() => { if (curKind && !el().paused) syncSession(true); }, 15000);
 
 /* ---------------- music style ---------------- */
 const HINT = { disco: 'Disco: smooth on calm songs, hard cuts on strong beats.', flow: 'Flow: colors glide around the wheel and jump on every beat.' };
@@ -659,6 +757,7 @@ function closeSub(silent) {
   if (!silent && history.state && history.state.sub) history.back();
 }
 window.addEventListener('popstate', () => {
+  if (!$('vp').classList.contains('hide')) { closePlayer(true); return; }
   if (sub) { const s = sub; sub = null; closeSubFromBack(s); }
 });
 function closeSubFromBack(s) {

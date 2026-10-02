@@ -10,7 +10,6 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(StripPlugin.class);
         registerPlugin(MusicLibraryPlugin.class);
-        registerPlugin(PlayerPlugin.class);
         super.onCreate(savedInstanceState);
         try {
             if (getBridge() != null) {

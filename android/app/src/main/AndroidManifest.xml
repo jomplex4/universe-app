@@ -26,27 +26,7 @@
         <service
             android:name=".LightService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
-
-        <!-- Karaoke video player: widescreen, edge to edge (the code takes care of the camera cutout). -->
-        <activity
-            android:name=".PlayerActivity"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:screenOrientation="sensorLandscape"
-            android:theme="@style/PlayerTheme" />
-
-        <!-- The one player for songs and videos. Android draws its notification and lock screen controls. -->
-        <service
-            android:name=".PlaybackService"
-            android:exported="true"
-            android:foregroundServiceType="mediaPlayback"
-            tools:ignore="ExportedService">
-            <intent-filter>
-                <action android:name="androidx.media3.session.MediaSessionService" />
-            </intent-filter>
-        </service>
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
 
         <receiver
             android:name=".Routines"

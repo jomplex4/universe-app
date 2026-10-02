@@ -16,11 +16,14 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.view.View;
+import android.view.WindowManager;
 
 import androidx.activity.result.ActivityResult;
 import androidx.core.content.ContextCompat;
@@ -345,7 +348,7 @@ public class StripPlugin extends Plugin {
     };
 
     /**
-     * session({ on, light })
+     * session({ on, bt, media, playing, light, title, artist })
      * Starts, updates or stops the background notification. "on" false stops it.
      */
     @PluginMethod
@@ -367,7 +370,14 @@ public class StripPlugin extends Plugin {
         Intent svc = new Intent(ctx, LightService.class);
         if (on) {
             svc.setAction(LightService.ACT_UPDATE)
-                .putExtra("light", Boolean.TRUE.equals(call.getBoolean("light", true)));
+                .putExtra("bt", Boolean.TRUE.equals(call.getBoolean("bt", false)))
+                .putExtra("media", Boolean.TRUE.equals(call.getBoolean("media", false)))
+                .putExtra("playing", Boolean.TRUE.equals(call.getBoolean("playing", false)))
+                .putExtra("light", Boolean.TRUE.equals(call.getBoolean("light", true)))
+                .putExtra("title", call.getString("title", ""))
+                .putExtra("artist", call.getString("artist", ""))
+                .putExtra("position", (long) call.getInt("position", 0))
+                .putExtra("duration", (long) call.getInt("duration", 0));
             try { ContextCompat.startForegroundService(ctx, svc); } catch (Exception ignored) { }
             if (!ticking) { ticking = true; main.post(ticker); }
         } else {
@@ -375,6 +385,40 @@ public class StripPlugin extends Plugin {
             ctx.stopService(svc);
         }
         call.resolve();
+    }
+
+    /** Full-screen player: hides Android bars and optionally turns the screen sideways. */
+    @PluginMethod
+    public void immersive(PluginCall call) {
+        boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
+        boolean land = Boolean.TRUE.equals(call.getBoolean("landscape", false));
+        getActivity().runOnUiThread(() -> {
+            android.app.Activity a = getActivity();
+            a.setRequestedOrientation(on && land ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+            View decor = a.getWindow().getDecorView();
+            if (on) {
+                a.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+                // Let the picture use the strip behind the camera, so "Fill" really covers the whole screen.
+                setCutoutMode(a, true);
+            } else {
+                a.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+                setCutoutMode(a, false);
+            }
+            call.resolve();
+        });
+    }
+
+    private static void setCutoutMode(android.app.Activity a, boolean useCutout) {
+        if (Build.VERSION.SDK_INT < 28) return;
+        WindowManager.LayoutParams lp = a.getWindow().getAttributes();
+        lp.layoutInDisplayCutoutMode = useCutout
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+        a.getWindow().setAttributes(lp);
     }
 
     @PluginMethod

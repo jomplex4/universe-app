@@ -1,7 +1,6 @@
 package com.digitalminds.universe;
 
 import android.Manifest;
-import android.content.ContentUris;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
@@ -55,8 +54,8 @@ public class MusicLibraryPlugin extends Plugin {
     private void read(PluginCall call, boolean video) {
         Uri uri = video ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI : MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
         String[] projection = video
-            ? new String[] { MediaStore.Video.Media.TITLE, MediaStore.Video.Media.DURATION, MediaStore.Video.Media.DATA, MediaStore.Video.Media.DATE_ADDED, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media._ID }
-            : new String[] { MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.DATA, MediaStore.Audio.Media.DATE_ADDED, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media._ID };
+            ? new String[] { MediaStore.Video.Media.TITLE, MediaStore.Video.Media.DURATION, MediaStore.Video.Media.DATA, MediaStore.Video.Media.DATE_ADDED, MediaStore.Video.Media.DISPLAY_NAME }
+            : new String[] { MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.DATA, MediaStore.Audio.Media.DATE_ADDED, MediaStore.Audio.Media.ARTIST };
         // Songs: skip ringtones and notification sounds. Videos: skip tiny clips.
         String selection = (video ? MediaStore.Video.Media.DURATION : MediaStore.Audio.Media.DURATION) + " >= ?";
         String[] args = { video ? "3000" : "15000" };
@@ -85,8 +84,6 @@ public class MusicLibraryPlugin extends Plugin {
                     item.put("duration", c.getLong(1));
                     item.put("added", added);
                     item.put("path", path);
-                    // The player opens files through MediaStore (works on internal and SD storage alike).
-                    item.put("uri", ContentUris.withAppendedId(uri, c.getLong(5)).toString());
 
                     String key = parent.getAbsolutePath();
                     List<JSObject> list = byFolder.get(key);
